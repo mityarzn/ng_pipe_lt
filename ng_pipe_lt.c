@@ -42,19 +42,18 @@
 
 #include <sys/param.h>
 #include <sys/errno.h>
-#include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/time.h>
+#include <sys/fnv_hash.h>
 
 #include <vm/uma.h>
 
-#include <net/vnet.h>
-
 #include <netinet/in.h>
-#include <netinet/in_systm.h>
 #include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <net/ethernet.h>
 
 #include <netgraph/ng_message.h>
 #include <netgraph/netgraph.h>
@@ -62,6 +61,20 @@
 #include <ng_pipe_lt.h>
 
 static MALLOC_DEFINE(M_NG_PIPE_LT, "ng_pipe_lt", "ng_pipe_lt");
+/* From in_var.h */
+#define INADDR_HASHVAL(x)	fnv_32_buf((&(x)), sizeof(x), FNV1_32_INIT)
+/* From in6_var.h */
+static __inline uint32_t
+in6_addrhash(struct in6_addr *in6)
+{
+        uint32_t x;
+
+        x = in6->s6_addr32[0] ^ in6->s6_addr32[1] ^ in6->s6_addr32[2] ^
+            in6->s6_addr32[3];
+        return (fnv_32_buf(&x, sizeof(x), FNV1_32_INIT));
+}
+#define IN6ADDR_HASHVAL(x)	(in6_addrhash(x))
+
 #define NGPL_HMASK	0x1f
 
 /* Packet header struct */
@@ -95,8 +108,6 @@ struct hookinfo {
 
 /* Per node info */
 struct node_priv {
-	u_int64_t		delay;
-	u_int32_t		header_offset;
 	struct hookinfo		lower;
 	struct hookinfo		upper;
 	struct callout		timer;
@@ -412,26 +423,51 @@ parse_cfg(struct ng_pipe_hookcfg *current, struct ng_pipe_hookcfg *new,
 }
 
 /*
- * TODO: Add IPv6 support.
- * Compute a hash signature for a packet. This function suffers from the
- * NIH sindrome, so probably it would be wise to look around what other
- * folks have found out to be a good and efficient IP hash function...
+ * Compute a hash signature for a packet. Used system-wide hash functions
+ * for IP v4 and v6. Here we expecting not-vlan-tagged Ethernet frames with IP
+ * payload. For anything else it will return zero.
  */
-static int
-ip_hash(struct mbuf *m, int offset)
+static uint32_t
+ip_hash(struct mbuf *m)
 {
-	u_int64_t i;
-	struct ip *ip = (struct ip *)(mtod(m, u_char *) + offset);
+	struct ether_header *eh;
+	struct ip      *ip4hdr;
+	struct ip6_hdr *ip6hdr;
 
-	if (m->m_len < sizeof(struct ip) + offset ||
-	    ip->ip_v != 4 || ip->ip_hl << 2 != sizeof(struct ip))
+	if ( m->m_len < sizeof(struct ether_header) &&
+	    (m = m_pullup(m, sizeof(struct ether_header))) == NULL) {
+		return (0);
+	}
+	eh = mtod(m, struct ether_header *);
+
+	/* Determine IP version and make corresponding hash.
+	 * Fallback to zero if not successfull. */
+	switch (ntohs(eh->ether_type)) {
+	case ETHERTYPE_IP:
+		if ( m->m_len < sizeof(struct ether_header)+sizeof(struct ip) &&
+		    (m = m_pullup(m, sizeof(struct ether_header)+sizeof(struct ip)))
+		    == NULL)
+			return (0);
+		ip4hdr = mtodo(m, ETHER_HDR_LEN);
+
+		return ( INADDR_HASHVAL(ip4hdr->ip_src.s_addr)
+			^INADDR_HASHVAL(ip4hdr->ip_dst.s_addr));
+	break;
+	case ETHERTYPE_IPV6:
+		if ( m->m_len < sizeof(struct ether_header)+sizeof(struct ip6_hdr) &&
+		    (m = m_pullup(m, sizeof(struct ether_header)+sizeof(struct ip6_hdr)))
+		    == NULL)
+			return (0);
+		ip6hdr = mtodo(m, ETHER_HDR_LEN);
+
+		return ( IN6ADDR_HASHVAL(&ip6hdr->ip6_src)
+			^IN6ADDR_HASHVAL(&ip6hdr->ip6_dst));
+	break;
+	default:
+	/* Not IPv4 or IPv6 */
 		return 0;
+	}
 
-	i = ((u_int64_t) ip->ip_src.s_addr ^
-	    ((u_int64_t) ip->ip_src.s_addr << 13) ^
-	    ((u_int64_t) ip->ip_dst.s_addr << 7) ^
-	    ((u_int64_t) ip->ip_dst.s_addr << 19));
-	return (i ^ (i >> 32));
 }
 
 /*
@@ -443,13 +479,13 @@ int
 ngpl_rcvdata(hook_p hook, item_p item)
 {
 	struct hookinfo *const hinfo = NG_HOOK_PRIVATE(hook);
-	const priv_p priv = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
+/* unused	const priv_p priv = NG_NODE_PRIVATE(NG_HOOK_NODE(hook)); */
 	struct timeval uuptime;
 	struct timeval *now = &uuptime;
 	struct ngpl_fifo *ngpl_f = NULL;
 	struct ngpl_hdr *ngpl_h = NULL;
 	struct mbuf *m;
-	int hash;
+	uint32_t hash;
 
 	getmicrouptime(now);
 
@@ -473,7 +509,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	if (hinfo->cfg.fifo)
 		hash = 0;	/* all packets go into a single FIFO queue */
 	else
-		hash = ip_hash(m, priv->header_offset) & NGPL_HMASK;
+		hash = ip_hash(m) & NGPL_HMASK;
 
 	//printf("ng_pipe_lt: select queue\n");
 	/* Find the appropriate FIFO queue for the packet and enqueue it*/
@@ -510,15 +546,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 
 /*
  * Dequeueing sequence - we basically do the following:
- *  1) Try to extract the frame from the inbound (bandwidth) queue;
- *  2) In accordance to BER specified, discard the frame randomly;
- *  3) If the frame survives BER, prepend it with delay info and move it
- *     to outbound (delay) queue;
- *  4) Loop to 2) until bandwidth quota for this timeslice is reached, or
- *     inbound queue is flushed completely;
- *  5) Dequeue frames from the outbound queue and send them downstream until
- *     outbound queue is flushed completely, or the next frame in the queue
- *     is not due to be dequeued yet
+ * TODO: rewrite.
  */
 void
 pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
