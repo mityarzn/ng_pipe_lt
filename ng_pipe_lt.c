@@ -61,7 +61,8 @@
 #include <netgraph/ng_parse.h>
 #include <ng_pipe_lt.h>
 
-static MALLOC_DEFINE(M_NG_PIPE, "ng_pipe_lt", "ng_pipe_lt");
+static MALLOC_DEFINE(M_NG_PIPE_LT, "ng_pipe_lt", "ng_pipe_lt");
+#define NGPL_HMASK	0x1f
 
 /* Packet header struct */
 struct ngpl_hdr {
@@ -75,7 +76,6 @@ struct ngpl_fifo {
 	TAILQ_ENTRY(ngpl_fifo)	fifo_le;	/* list of active queues only */
 	struct p_head		packet_head;	/* FIFO queue head */
 	u_int32_t		hash;		/* flow signature */
-	struct timeval		vtime;		/* virtual time, for WFQ */
 	u_int32_t		rr_deficit;	/* for DRR */
 	u_int32_t		packets;	/* # of packets in this queue */
 };
@@ -85,6 +85,7 @@ struct hookinfo {
 	hook_p			hook;
 	int			noqueue;	/* bypass any processing */
 	TAILQ_HEAD(, ngpl_fifo)	fifo_head;	/* FIFO queues */
+	struct ngpl_fifo 	*fifo_array[NGPL_HMASK+1]; /* array of same FIFO queues */
 	struct timeval		qin_utime;
 	struct ng_pipe_hookcfg	cfg;
 	struct ng_pipe_hookrun	run;
@@ -229,7 +230,7 @@ ngpl_constructor(node_p node)
 {
 	priv_p priv;
 
-	priv = malloc(sizeof(*priv), M_NG_PIPE, M_ZERO | M_WAITOK);
+	priv = malloc(sizeof(*priv), M_NG_PIPE_LT, M_ZERO | M_WAITOK);
 	NG_NODE_SET_PRIVATE(node, priv);
 
 	/* Mark node as single-threaded */
@@ -472,16 +473,17 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	if (hinfo->cfg.fifo)
 		hash = 0;	/* all packets go into a single FIFO queue */
 	else
-		hash = ip_hash(m, priv->header_offset);
+		hash = ip_hash(m, priv->header_offset) & NGPL_HMASK;
 
 	//printf("ng_pipe_lt: select queue\n");
 	/* Find the appropriate FIFO queue for the packet and enqueue it*/
-	TAILQ_FOREACH(ngpl_f, &hinfo->fifo_head, fifo_le)
-		if (hash == ngpl_f->hash)
-			break;
+
+	ngpl_f = hinfo->fifo_array[hash];
+
 	if (ngpl_f == NULL) {
 		ngpl_f = uma_zalloc(ngpl_zone, M_NOWAIT);
 		KASSERT(ngpl_h != NULL, ("ngpl_h zalloc failed (2)"));
+		hinfo->fifo_array[hash] = ngpl_f;
 		TAILQ_INIT(&ngpl_f->packet_head);
 		ngpl_f->hash = hash;
 		ngpl_f->packets = 1;
@@ -598,6 +600,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 
 		if (!ngpl_f->packets) {
 			TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
+			hinfo->fifo_array[ngpl_f->hash] = NULL;
 			uma_zfree(ngpl_zone, ngpl_f);
 			hinfo->run.fifo_queues--;
 		}
@@ -668,7 +671,7 @@ ngpl_shutdown(node_p node)
 			ng_rmhook_self(priv->lower.hook);
 	}
 	NG_NODE_UNREF(node);
-	free(priv, M_NG_PIPE);
+	free(priv, M_NG_PIPE_LT);
 	return (0);
 }
 
@@ -694,6 +697,7 @@ ngpl_disconnect(hook_p hook)
 			uma_zfree(ngpl_zone, ngpl_h);
 		}
 		TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
+		hinfo->fifo_array[ngpl_f->hash] = NULL;
 		uma_zfree(ngpl_zone, ngpl_f);
 	}
 
