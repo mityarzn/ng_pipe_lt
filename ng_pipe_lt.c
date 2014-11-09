@@ -96,7 +96,6 @@ struct hookinfo {
 /* Per node info */
 struct node_priv {
 	u_int64_t		delay;
-	u_int32_t		overhead;
 	u_int32_t		header_offset;
 	struct hookinfo		lower;
 	struct hookinfo		upper;
@@ -109,7 +108,7 @@ typedef struct node_priv *priv_p;
 #define FIFO_VTIME_SORT(plen)						\
 	if (hinfo->cfg.wfq && hinfo->cfg.bandwidth) {			\
 		ngpl_f->vtime.tv_usec = now->tv_usec + ((uint64_t) (plen) \
-			+ priv->overhead ) * hinfo->run.fifo_queues *	\
+			) * hinfo->run.fifo_queues *	\
 			8000000 / hinfo->cfg.bandwidth;			\
 		ngpl_f->vtime.tv_sec = now->tv_sec +			\
 			ngpl_f->vtime.tv_usec / 1000000;			\
@@ -353,7 +352,6 @@ ngpl_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				sizeof(cfg->downstream));
 			bcopy(&priv->lower.cfg, &cfg->upstream,
 				sizeof(cfg->upstream));
-			cfg->overhead = priv->overhead;
 			if (cfg->upstream.bandwidth ==
 			    cfg->downstream.bandwidth) {
 				cfg->bandwidth = cfg->upstream.bandwidth;
@@ -372,22 +370,11 @@ ngpl_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			if (cfg->bandwidth == -1) {
 				priv->upper.cfg.bandwidth = 0;
 				priv->lower.cfg.bandwidth = 0;
-				priv->overhead = 0;
 			} else if (cfg->bandwidth >= 100 &&
 			    cfg->bandwidth <= 1000000000) {
 				priv->upper.cfg.bandwidth = cfg->bandwidth;
 				priv->lower.cfg.bandwidth = cfg->bandwidth;
-				if (cfg->bandwidth >= 10000000)
-					priv->overhead = 8+4+12; /* Ethernet */
-				else
-					priv->overhead = 10; /* HDLC */
 			}
-
-			if (cfg->overhead == -1)
-				priv->overhead = 0;
-			else if (cfg->overhead > 0 &&
-			    cfg->overhead < MAX_OHSIZE)
-				priv->overhead = cfg->overhead;
 
 			parse_cfg(&priv->upper.cfg, &cfg->downstream,
 			    &priv->upper, priv);
@@ -504,13 +491,23 @@ ngpl_rcvdata(hook_p hook, item_p item)
 
 	getmicrouptime(now);
 
+	NGI_GET_M(item, m);
+	KASSERT(m != NULL, ("NGI_GET_M failed"));
+	NG_FREE_ITEM(item);
+
+	/* Discard THIS frame if inbound queue limit has been reached */
+	if (hinfo->run.qin_frames >= hinfo->cfg.qin_size_limit) {
+		//printf("ng_pipe_lt: queue overrun, drop packet\n");
+
+		hinfo->stats.in_disc_octets += m->m_pkthdr.len;
+		hinfo->stats.in_disc_frames++;
+		NG_FREE_M(m);
+		return (0);
+	}
 	/* Populate the packet header */
 	ngpl_h = uma_zalloc(ngpl_zone, M_NOWAIT);
 	KASSERT((ngpl_h != NULL), ("ngpl_h zalloc failed (1)"));
-	NGI_GET_M(item, m);
-	KASSERT(m != NULL, ("NGI_GET_M failed"));
 	ngpl_h->m = m;
-	NG_FREE_ITEM(item);
 
 	if (hinfo->cfg.fifo)
 		hash = 0;	/* all packets go into a single FIFO queue */
@@ -539,36 +536,6 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	hinfo->run.qin_frames++;
 	hinfo->run.qin_octets += m->m_pkthdr.len;
 	//printf("ng_pipe_lt: placed packet to queue\n");
-
-	/* Discard a frame if inbound queue limit has been reached */
-	if (hinfo->run.qin_frames > hinfo->cfg.qin_size_limit) {
-		//printf("ng_pipe_lt: queue overrun, drop packet\n");
-		struct mbuf *m1;
-		int longest = 0;
-
-		/* Find the longest queue */
-		TAILQ_FOREACH(ngpl_f1, &hinfo->fifo_head, fifo_le)
-			if (ngpl_f1->packets > longest) {
-				longest = ngpl_f1->packets;
-				ngpl_f = ngpl_f1;
-			}
-
-		/* Drop a frame from the queue head/tail, depending on cfg */
-		ngpl_h = TAILQ_FIRST(&ngpl_f->packet_head);
-		TAILQ_REMOVE(&ngpl_f->packet_head, ngpl_h, ngpl_link);
-		m1 = ngpl_h->m;
-		uma_zfree(ngpl_zone, ngpl_h);
-		hinfo->run.qin_octets -= m1->m_pkthdr.len;
-		hinfo->stats.in_disc_octets += m1->m_pkthdr.len;
-		m_freem(m1);
-		if (--(ngpl_f->packets) == 0) {
-			TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
-			uma_zfree(ngpl_zone, ngpl_f);
-			hinfo->run.fifo_queues--;
-		}
-		hinfo->run.qin_frames--;
-		hinfo->stats.in_disc_frames++;
-	}
 
 	/*
 	 * Try to start the dequeuing process immediately.
