@@ -445,7 +445,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	const priv_p priv = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
 	struct timeval uuptime;
 	struct timeval *now = &uuptime;
-	struct ngpl_fifo *ngpl_f = NULL, *ngpl_f1;
+	struct ngpl_fifo *ngpl_f = NULL;
 	struct ngpl_hdr *ngpl_h = NULL;
 	struct mbuf *m;
 	int hash;
@@ -488,7 +488,6 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		ngpl_f->rr_deficit = hinfo->cfg.drr;	/* DRR quantum */
 		hinfo->run.fifo_queues++;
 		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
-		FIFO_VTIME_SORT(m->m_pkthdr.len);
 	} else {
 		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
 		ngpl_f->packets++;
@@ -524,7 +523,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	const node_p node = NG_HOOK_NODE(hinfo->hook);
 	const priv_p priv = NG_NODE_PRIVATE(node);
 	struct hookinfo *dest;
-	struct ngpl_fifo *ngpl_f, *ngpl_f1;
+	struct ngpl_fifo *ngpl_f;
 	struct ngpl_hdr *ngpl_h;
 	struct timeval timediff;
 	struct mbuf *m;
