@@ -31,13 +31,15 @@
  */
 
 /*
- * This node permits simple traffic shaping by emulating bandwidth
- * and delay, as well as random packet losses.
+ * This node permits simple traffic shaping by emulating bandwidth.
  * The node has two hooks, upper and lower. Traffic flowing from upper to
  * lower hook is referenced as downstream, and vice versa. Parameters for
  * both directions can be set separately, except for delay.
  */
 
+/* temporary for debug */
+#define NETGRAPH_DEBUG 1
+#include <sys/syslog.h>
 
 #include <sys/param.h>
 #include <sys/errno.h>
@@ -60,7 +62,7 @@
 #include <netgraph/ng_parse.h>
 #include <ng_pipe_lt.h>
 
-static MALLOC_DEFINE(M_NG_PIPE, "ng_pipe", "ng_pipe");
+static MALLOC_DEFINE(M_NG_PIPE, "ng_pipe_lt", "ng_pipe_lt");
 
 /* Packet header struct */
 struct ngpl_hdr {
@@ -244,7 +246,7 @@ static struct ng_type ng_pipe_typestruct = {
 	.disconnect =	ngpl_disconnect,
 	.cmdlist =	ngpl_cmds
 };
-NETGRAPH_INIT(pipe, &ng_pipe_typestruct);
+NETGRAPH_INIT(pipe_lt, &ng_pipe_typestruct);
 
 /* Node constructor */
 static int
@@ -490,7 +492,7 @@ ip_hash(struct mbuf *m, int offset)
  * depending on dropping policy (from the head or from the tail of the
  * queue).
  */
-static int
+int
 ngpl_rcvdata(hook_p hook, item_p item)
 {
 	struct hookinfo *const hinfo = NG_HOOK_PRIVATE(hook);
@@ -502,9 +504,9 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	struct mbuf *m;
 	int hash;
 
-        getmicrouptime(now);
+	getmicrouptime(now);
 
-        /* Populate the packet header */
+	/* Populate the packet header */
 	ngpl_h = uma_zalloc(ngpl_zone, M_NOWAIT);
 	KASSERT((ngpl_h != NULL), ("ngpl_h zalloc failed (1)"));
 	NGI_GET_M(item, m);
@@ -517,6 +519,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	else
 		hash = ip_hash(m, priv->header_offset);
 
+	//printf("ng_pipe_lt: select queue\n");
 	/* Find the appropriate FIFO queue for the packet and enqueue it*/
 	TAILQ_FOREACH(ngpl_f, &hinfo->fifo_head, fifo_le)
 		if (hash == ngpl_f->hash)
@@ -537,9 +540,11 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	}
 	hinfo->run.qin_frames++;
 	hinfo->run.qin_octets += m->m_pkthdr.len;
+	//printf("ng_pipe_lt: placed packet to queue\n");
 
 	/* Discard a frame if inbound queue limit has been reached */
 	if (hinfo->run.qin_frames > hinfo->cfg.qin_size_limit) {
+		//printf("ng_pipe_lt: queue overrun, drop packet\n");
 		struct mbuf *m1;
 		int longest = 0;
 
@@ -570,6 +575,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	/*
 	 * Try to start the dequeuing process immediately.
 	 */
+	//printf("ng_pipe_lt: start dequeue\n");
 	pipe_dequeue(hinfo, now);
 
 	return (0);
@@ -588,7 +594,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
  *     outbound queue is flushed completely, or the next frame in the queue
  *     is not due to be dequeued yet
  */
-static void
+void
 pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	const node_p node = NG_HOOK_NODE(hinfo->hook);
 	const priv_p priv = NG_NODE_PRIVATE(node);
@@ -598,7 +604,10 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	struct timeval timediff;
 	struct mbuf *m;
 	int error = 0;
+	u_int64_t psize;
         u_int32_t cbs = hinfo->cfg.bandwidth/8;
+
+//	printf("ng_pipe_lt: refill tokens\n");
 
         /*
          * Refill token bucket. Once per run, because I'm sure it will not refill
@@ -608,13 +617,22 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
         timevalsub(&timediff,&hinfo->last_refill);
         if (timevalisset(&timediff)) { /* At least ont tick since last refill */
           if (timediff.tv_sec == 0) {
+	    //log(LOG_DEBUG, "There's %li microseconds since last refill. Refilling by %li bytes\n",
+		timediff.tv_usec, cbs*timediff.tv_usec/1000000);
             hinfo->run.tc += (cbs*timediff.tv_usec/1000000 );
             /* We have hardcoded max tokens for one second on max bandwidth.*/
-            if (hinfo->run.tc > cbs)
-              hinfo->run.tc = cbs;
-          } else
-            hinfo->run.tc = cbs;
+            if (hinfo->run.tc > cbs) {
+		//log(LOG_DEBUG, "run.tc > cbs, truncating\n");
+		hinfo->run.tc = cbs;
+	    }
+          } else {
+		//log(LOG_DEBUG, "There's more than 1 sec from last refill, truncating\n");
+		hinfo->run.tc = cbs;
+	  }
         }
+        hinfo->last_refill = *now;
+
+//        printf("ng_pipe_lt: done tokens refill\n");
 
 	/* Which one is the destination hook? */
 	if (hinfo == &priv->lower)
@@ -626,14 +644,17 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	while ((ngpl_f = TAILQ_FIRST(&hinfo->fifo_head))) {
 		ngpl_h = TAILQ_FIRST(&ngpl_f->packet_head);
 		m = ngpl_h->m;
+		psize = m->m_pkthdr.len;
 
-                /* Syopqueue processing if there's not enougth tokens */
-                if (m->m_pkthdr.len > hinfo->run.tc)
+		/* Stop queue processing if there's not enougth tokens */
+		if (psize > hinfo->run.tc)
+			break;
+//		printf("ng_pipe_lt: drr processing\n");
 
 		/* Deficit Round Robin (DRR) processing */
 		if (hinfo->cfg.drr) {
-			if (ngpl_f->rr_deficit >= m->m_pkthdr.len) {
-				ngpl_f->rr_deficit -= m->m_pkthdr.len;
+			if (ngpl_f->rr_deficit >= psize) {
+				ngpl_f->rr_deficit -= psize;
 			} else {
 				ngpl_f->rr_deficit += hinfo->cfg.drr;
 				TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
@@ -643,12 +664,14 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 			}
 		}
 
+//		printf("ng_pipe_lt: dequeue packet\n");
 		/* Actually dequeue packet */
 		TAILQ_REMOVE(&ngpl_f->packet_head, ngpl_h, ngpl_link);
 		hinfo->run.qin_frames--;
-		hinfo->run.qin_octets -= m->m_pkthdr.len;
+		hinfo->run.qin_octets -= psize;
 		ngpl_f->packets--;
 
+//		printf("ng_pipe_lt: Sort / rearrange inbound queues\n");
 		/* Sort / rearrange inbound queues */
 		if (ngpl_f->packets) {
 			if (hinfo->cfg.wfq) {
@@ -662,14 +685,19 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 			hinfo->run.fifo_queues--;
 		}
 
+
+//		printf("ng_pipe_lt: Sendpacket to next node\n");
+//		printf("ng_pipe_lt: hook %p, mbuf %p\n",dest->hook, m);
                 NG_SEND_DATA_ONLY(error, dest->hook, m);
+
                 if (!error) {
                         hinfo->stats.fwd_frames++;
-                        hinfo->stats.fwd_octets += m->m_pkthdr.len;
+                        hinfo->stats.fwd_octets += psize;
+			hinfo->run.tc -= psize;
                 }
                 /* Decrement tokens */
-                hinfo->run.tc -= m->m_pkthdr.len;
 	}
+//	printf("ng_pipe_lt: done queue processing, take careof callout\n");
 
 	if (hinfo->run.qin_frames != 0) {
           if (!priv->timer_scheduled) {
@@ -677,7 +705,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 		priv->timer_scheduled = 1;
           }
 	} else { /* We have empty queue. Cancel callout. */
-          if (priv->timer_scheduled == 1) {
+          if (priv->timer_scheduled) {
             ng_uncallout(&priv->timer, node);
             priv->timer_scheduled = 0;
           }
