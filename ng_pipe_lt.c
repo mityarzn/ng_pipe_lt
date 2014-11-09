@@ -86,7 +86,6 @@ struct hookinfo {
 	hook_p			hook;
 	int			noqueue;	/* bypass any processing */
 	TAILQ_HEAD(, ngpl_fifo)	fifo_head;	/* FIFO queues */
-	TAILQ_HEAD(, ngpl_hdr)	qout_head;	/* delay queue head */
 	struct timeval		qin_utime;
 	struct ng_pipe_hookcfg	cfg;
 	struct ng_pipe_hookrun	run;
@@ -289,7 +288,6 @@ ngpl_newhook(node_p node, hook_p hook, const char *name)
 	hinfo->cfg.fifo = 1;
 	hinfo->cfg.droptail = 1;
 	TAILQ_INIT(&hinfo->fifo_head);
-	TAILQ_INIT(&hinfo->qout_head);
 	return (0);
 }
 
@@ -617,8 +615,8 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
         timevalsub(&timediff,&hinfo->last_refill);
         if (timevalisset(&timediff)) { /* At least ont tick since last refill */
           if (timediff.tv_sec == 0) {
-	    //log(LOG_DEBUG, "There's %li microseconds since last refill. Refilling by %li bytes\n",
-		timediff.tv_usec, cbs*timediff.tv_usec/1000000);
+	    /*log(LOG_DEBUG, "There's %li microseconds since last refill. Refilling by %li bytes\n",
+		timediff.tv_usec, cbs*timediff.tv_usec/1000000);*/
             hinfo->run.tc += (cbs*timediff.tv_usec/1000000 );
             /* We have hardcoded max tokens for one second on max bandwidth.*/
             if (hinfo->run.tc > cbs) {
@@ -667,6 +665,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 //		printf("ng_pipe_lt: dequeue packet\n");
 		/* Actually dequeue packet */
 		TAILQ_REMOVE(&ngpl_f->packet_head, ngpl_h, ngpl_link);
+		uma_zfree(ngpl_zone, ngpl_h);
 		hinfo->run.qin_frames--;
 		hinfo->run.qin_octets -= psize;
 		ngpl_f->packets--;
@@ -685,9 +684,6 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 			hinfo->run.fifo_queues--;
 		}
 
-
-//		printf("ng_pipe_lt: Sendpacket to next node\n");
-//		printf("ng_pipe_lt: hook %p, mbuf %p\n",dest->hook, m);
                 NG_SEND_DATA_ONLY(error, dest->hook, m);
 
                 if (!error) {
@@ -781,13 +777,6 @@ ngpl_disconnect(hook_p hook)
 		}
 		TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
 		uma_zfree(ngpl_zone, ngpl_f);
-	}
-
-	/* Flush the delay queue */
-	while ((ngpl_h = TAILQ_FIRST(&hinfo->qout_head))) {
-		TAILQ_REMOVE(&hinfo->qout_head, ngpl_h, ngpl_link);
-		m_freem(ngpl_h->m);
-		uma_zfree(ngpl_zone, ngpl_h);
 	}
 
 	return (0);
