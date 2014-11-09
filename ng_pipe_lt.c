@@ -1,6 +1,7 @@
 /*-
  * Copyright (c) 2004-2010 University of Zagreb
  * Copyright (c) 2007-2008 FreeBSD Foundation
+ * Copyright (c) 2014-2014 Dmitry Petuhov <mityapetuhov@gmail.com>
  *
  * This software was developed by the University of Zagreb and the
  * FreeBSD Foundation under sponsorship by the Stichting NLnet and the
@@ -26,15 +27,13 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $FreeBSD: release/10.0.0/sys/netgraph/ng_pipe.c 222257 2011-05-24 14:36:32Z zec $
  */
 
 /*
  * This node permits simple traffic shaping by emulating bandwidth.
  * The node has two hooks, upper and lower. Traffic flowing from upper to
  * lower hook is referenced as downstream, and vice versa. Parameters for
- * both directions can be set separately, except for delay.
+ * both directions can be set separately.
  */
 
 /* temporary for debug */
@@ -103,28 +102,6 @@ struct node_priv {
 	int			timer_scheduled;
 };
 typedef struct node_priv *priv_p;
-
-/* Macro for calculating the virtual time for packet dequeueing in WFQ */
-#define FIFO_VTIME_SORT(plen)						\
-	if (hinfo->cfg.wfq && hinfo->cfg.bandwidth) {			\
-		ngpl_f->vtime.tv_usec = now->tv_usec + ((uint64_t) (plen) \
-			) * hinfo->run.fifo_queues *	\
-			8000000 / hinfo->cfg.bandwidth;			\
-		ngpl_f->vtime.tv_sec = now->tv_sec +			\
-			ngpl_f->vtime.tv_usec / 1000000;			\
-		ngpl_f->vtime.tv_usec = ngpl_f->vtime.tv_usec % 1000000;	\
-		TAILQ_FOREACH(ngpl_f1, &hinfo->fifo_head, fifo_le)	\
-			if (ngpl_f1->vtime.tv_sec > ngpl_f->vtime.tv_sec || \
-			    (ngpl_f1->vtime.tv_sec == ngpl_f->vtime.tv_sec && \
-			    ngpl_f1->vtime.tv_usec > ngpl_f->vtime.tv_usec)) \
-				break;					\
-		if (ngpl_f1 == NULL)					\
-			TAILQ_INSERT_TAIL(&hinfo->fifo_head, ngpl_f, fifo_le); \
-		else							\
-			TAILQ_INSERT_BEFORE(ngpl_f1, ngpl_f, fifo_le);	\
-	} else								\
-		TAILQ_INSERT_TAIL(&hinfo->fifo_head, ngpl_f, fifo_le);	\
-
 
 static void	parse_cfg(struct ng_pipe_hookcfg *, struct ng_pipe_hookcfg *,
 			struct hookinfo *, priv_p);
@@ -283,9 +260,8 @@ ngpl_newhook(node_p node, hook_p hook, const char *name)
 
 	/* Load non-zero initial cfg values */
 	hinfo = NG_HOOK_PRIVATE(hook);
-	hinfo->cfg.qin_size_limit = 50;
+	hinfo->cfg.qin_size_limit = 100;
 	hinfo->cfg.fifo = 1;
-	hinfo->cfg.droptail = 1;
 	TAILQ_INIT(&hinfo->fifo_head);
 	return (0);
 }
@@ -409,19 +385,11 @@ parse_cfg(struct ng_pipe_hookcfg *current, struct ng_pipe_hookcfg *new,
 
 	if (new->fifo) {
 		current->fifo = 1;
-		current->wfq = 0;
-		current->drr = 0;
-	}
-
-	if (new->wfq) {
-		current->fifo = 0;
-		current->wfq = 1;
 		current->drr = 0;
 	}
 
 	if (new->drr) {
 		current->fifo = 0;
-		current->wfq = 0;
 		/* DRR quantum */
 		if (new->drr >= 32)
 			current->drr = new->drr;
@@ -429,14 +397,9 @@ parse_cfg(struct ng_pipe_hookcfg *current, struct ng_pipe_hookcfg *new,
 			current->drr = 2048;		/* default quantum */
 	}
 
-	if (new->droptail) {
-		current->droptail = 1;
-	}
-
 	if (new->bandwidth == -1) {
 		current->bandwidth = 0;
 		current->fifo = 1;
-		current->wfq = 0;
 		current->drr = 0;
 	} else if (new->bandwidth >= 100 && new->bandwidth <= 1000000000)
 		current->bandwidth = new->bandwidth;
@@ -473,9 +436,7 @@ ip_hash(struct mbuf *m, int offset)
 /*
  * Receive data on a hook - both in upstream and downstream direction.
  * We put the frame on the inbound queue, and try to initiate dequeuing
- * sequence immediately. If inbound queue is full, discard one frame
- * depending on dropping policy (from the head or from the tail of the
- * queue).
+ * sequence immediately.
  */
 int
 ngpl_rcvdata(hook_p hook, item_p item)
@@ -497,11 +458,10 @@ ngpl_rcvdata(hook_p hook, item_p item)
 
 	/* Discard THIS frame if inbound queue limit has been reached */
 	if (hinfo->run.qin_frames >= hinfo->cfg.qin_size_limit) {
-		//printf("ng_pipe_lt: queue overrun, drop packet\n");
-
 		hinfo->stats.in_disc_octets += m->m_pkthdr.len;
 		hinfo->stats.in_disc_frames++;
 		NG_FREE_M(m);
+		pipe_dequeue(hinfo, now);
 		return (0);
 	}
 	/* Populate the packet header */
@@ -637,15 +597,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 		hinfo->run.qin_octets -= psize;
 		ngpl_f->packets--;
 
-//		printf("ng_pipe_lt: Sort / rearrange inbound queues\n");
-		/* Sort / rearrange inbound queues */
-		if (ngpl_f->packets) {
-			if (hinfo->cfg.wfq) {
-				TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
-				FIFO_VTIME_SORT(TAILQ_FIRST(
-				    &ngpl_f->packet_head)->m->m_pkthdr.len)
-			}
-		} else {
+		if (!ngpl_f->packets) {
 			TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
 			uma_zfree(ngpl_zone, ngpl_f);
 			hinfo->run.fifo_queues--;
@@ -656,13 +608,13 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
                 if (!error) {
                         hinfo->stats.fwd_frames++;
                         hinfo->stats.fwd_octets += psize;
+			/* Decrement tokens */
 			hinfo->run.tc -= psize;
                 }
-                /* Decrement tokens */
 	}
 //	printf("ng_pipe_lt: done queue processing, take careof callout\n");
 
-	if (hinfo->run.qin_frames != 0) {
+	if (hinfo->run.qin_frames) {
           if (!priv->timer_scheduled) {
 		ng_callout(&priv->timer, node, NULL, 1, ngpl_callout, NULL, 0);
 		priv->timer_scheduled = 1;
@@ -760,7 +712,7 @@ ngpl_modevent(module_t mod, int type, void *unused)
 		    sizeof (struct ngpl_fifo)), NULL, NULL, NULL, NULL,
 		    UMA_ALIGN_PTR, 0);
 		if (ngpl_zone == NULL)
-			panic("ng_pipe: couldn't allocate descriptor zone");
+			panic("ng_pipe_lt: couldn't allocate descriptor zone");
 		break;
 	case MOD_UNLOAD:
 		uma_zdestroy(ngpl_zone);

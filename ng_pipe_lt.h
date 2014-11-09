@@ -110,8 +110,6 @@ struct ng_pipe_hookcfg {
 	u_int32_t		qin_size_limit;
 	u_int32_t		fifo;
 	u_int32_t		drr;
-	u_int32_t		wfq;
-	u_int32_t		droptail;
 };
 
 /* Keep this in sync with the above structure definition */
@@ -120,8 +118,6 @@ struct ng_pipe_hookcfg {
 	{ "queuelen",		&ng_parse_uint32_type	},		\
 	{ "fifo",		&ng_parse_uint32_type	},		\
 	{ "drr",		&ng_parse_uint32_type	},		\
-	{ "wfq",		&ng_parse_uint32_type	},		\
-	{ "droptail",		&ng_parse_uint32_type	},		\
 	{ NULL },							\
 }
 
