@@ -434,30 +434,37 @@ ip_hash(struct mbuf *m)
 	struct ip      *ip4hdr;
 	struct ip6_hdr *ip6hdr;
 
-	if ( m->m_len < sizeof(struct ether_header) &&
-	    (m = m_pullup(m, sizeof(struct ether_header))) == NULL) {
-		return (0);
-	}
+	/* We can not do that because m_pullup() potentially modifies mbuf.
+	 * Assume someone done it for us.
+	 * if ( m->m_len < sizeof(struct ether_header) &&
+	 *     (m = m_pullup(m, sizeof(struct ether_header))) == NULL) {
+	 * 	return (0);
+	 * }
+	 */
 	eh = mtod(m, struct ether_header *);
 
 	/* Determine IP version and make corresponding hash.
 	 * Fallback to zero if not successfull. */
 	switch (ntohs(eh->ether_type)) {
 	case ETHERTYPE_IP:
-		if ( m->m_len < sizeof(struct ether_header)+sizeof(struct ip) &&
-		    (m = m_pullup(m, sizeof(struct ether_header)+sizeof(struct ip)))
-		    == NULL)
-			return (0);
+		/* Assume someone done it for us
+		 * if ( m->m_len < sizeof(struct ether_header)+sizeof(struct ip) &&
+		 *     (m = m_pullup(m, sizeof(struct ether_header)+sizeof(struct ip)))
+		 *     == NULL)
+		 * 	return (0);
+		 */
 		ip4hdr = mtodo(m, ETHER_HDR_LEN);
 
 		return ( INADDR_HASHVAL(ip4hdr->ip_src.s_addr)
 			^INADDR_HASHVAL(ip4hdr->ip_dst.s_addr));
 	break;
 	case ETHERTYPE_IPV6:
-		if ( m->m_len < sizeof(struct ether_header)+sizeof(struct ip6_hdr) &&
-		    (m = m_pullup(m, sizeof(struct ether_header)+sizeof(struct ip6_hdr)))
-		    == NULL)
-			return (0);
+		/* Assume someone done it for us
+		 * if ( m->m_len < sizeof(struct ether_header)+sizeof(struct ip6_hdr) &&
+		 *     (m = m_pullup(m, sizeof(struct ether_header)+sizeof(struct ip6_hdr)))
+		 *     == NULL)
+		 * 	return (0);
+		 */
 		ip6hdr = mtodo(m, ETHER_HDR_LEN);
 
 		return ( IN6ADDR_HASHVAL(&ip6hdr->ip6_src)
@@ -561,8 +568,6 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	u_int64_t psize;
         u_int32_t cbs = hinfo->cfg.bandwidth/8;
 
-//	printf("ng_pipe_lt: refill tokens\n");
-
         /*
          * Refill token bucket. Once per run, because I'm sure it will not refill
          * again.
@@ -571,22 +576,16 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
         timevalsub(&timediff,&hinfo->last_refill);
         if (timevalisset(&timediff)) { /* At least ont tick since last refill */
           if (timediff.tv_sec == 0) {
-	    /*log(LOG_DEBUG, "There's %li microseconds since last refill. Refilling by %li bytes\n",
-		timediff.tv_usec, cbs*timediff.tv_usec/1000000);*/
             hinfo->run.tc += (cbs*timediff.tv_usec/1000000 );
             /* We have hardcoded max tokens for one second on max bandwidth.*/
             if (hinfo->run.tc > cbs) {
-		//log(LOG_DEBUG, "run.tc > cbs, truncating\n");
 		hinfo->run.tc = cbs;
 	    }
           } else {
-		//log(LOG_DEBUG, "There's more than 1 sec from last refill, truncating\n");
 		hinfo->run.tc = cbs;
 	  }
         }
         hinfo->last_refill = *now;
-
-//        printf("ng_pipe_lt: done tokens refill\n");
 
 	/* Which one is the destination hook? */
 	if (hinfo == &priv->lower)
@@ -603,7 +602,6 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 		/* Stop queue processing if there's not enougth tokens */
 		if (psize > hinfo->run.tc)
 			break;
-//		printf("ng_pipe_lt: drr processing\n");
 
 		/* Deficit Round Robin (DRR) processing */
 		if (hinfo->cfg.drr) {
@@ -618,7 +616,6 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 			}
 		}
 
-//		printf("ng_pipe_lt: dequeue packet\n");
 		/* Actually dequeue packet */
 		TAILQ_REMOVE(&ngpl_f->packet_head, ngpl_h, ngpl_link);
 		uma_zfree(ngpl_zone, ngpl_h);
@@ -642,7 +639,6 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 			hinfo->run.tc -= psize;
                 }
 	}
-//	printf("ng_pipe_lt: done queue processing, take careof callout\n");
 
 	if (hinfo->run.qin_frames) {
           if (!priv->timer_scheduled) {
@@ -721,7 +717,7 @@ ngpl_disconnect(hook_p hook)
 	while ((ngpl_f = TAILQ_FIRST(&hinfo->fifo_head))) {
 		while ((ngpl_h = TAILQ_FIRST(&ngpl_f->packet_head))) {
 			TAILQ_REMOVE(&ngpl_f->packet_head, ngpl_h, ngpl_link);
-			m_freem(ngpl_h->m);
+			NG_FREE_M(ngpl_h->m);
 			uma_zfree(ngpl_zone, ngpl_h);
 		}
 		TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
