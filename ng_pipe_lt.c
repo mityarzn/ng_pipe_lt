@@ -518,7 +518,6 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	else
 		hash = ip_hash(m) & NGPL_HMASK;
 
-	//printf("ng_pipe_lt: select queue\n");
 	/* Find the appropriate FIFO queue for the packet and enqueue it*/
 
 	ngpl_f = hinfo->fifo_array[hash];
@@ -533,18 +532,17 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		ngpl_f->rr_deficit = hinfo->cfg.drr;	/* DRR quantum */
 		hinfo->run.fifo_queues++;
 		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
+		TAILQ_INSERT_TAIL(&hinfo->fifo_head, ngpl_f, fifo_le);
 	} else {
 		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
 		ngpl_f->packets++;
 	}
 	hinfo->run.qin_frames++;
 	hinfo->run.qin_octets += m->m_pkthdr.len;
-	//printf("ng_pipe_lt: placed packet to queue\n");
 
 	/*
 	 * Try to start the dequeuing process immediately.
 	 */
-	//printf("ng_pipe_lt: start dequeue\n");
 	pipe_dequeue(hinfo, now);
 
 	return (0);
