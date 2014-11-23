@@ -428,44 +428,41 @@ parse_cfg(struct ng_pipe_hookcfg *current, struct ng_pipe_hookcfg *new,
  * payload. For anything else it will return zero.
  */
 static uint32_t
-ip_hash(struct mbuf *m)
+ip_hash(struct mbuf **m)
 {
 	struct ether_header *eh;
 	struct ip      *ip4hdr;
 	struct ip6_hdr *ip6hdr;
 
-	/* We can not do that because m_pullup() potentially modifies mbuf.
-	 * Assume someone done it for us.
-	 * if ( m->m_len < sizeof(struct ether_header) &&
-	 *     (m = m_pullup(m, sizeof(struct ether_header))) == NULL) {
-	 * 	return (0);
-	 * }
-	 */
-	eh = mtod(m, struct ether_header *);
+
+	 if ( (*m)->m_len < sizeof(struct ether_header) &&
+	     (*m = m_pullup(*m, sizeof(struct ether_header))) == NULL) {
+	 	return (0);
+	 }
+
+	eh = mtod(*m, struct ether_header *);
 
 	/* Determine IP version and make corresponding hash.
 	 * Fallback to zero if not successfull. */
 	switch (ntohs(eh->ether_type)) {
 	case ETHERTYPE_IP:
-		/* Assume someone done it for us
-		 * if ( m->m_len < sizeof(struct ether_header)+sizeof(struct ip) &&
-		 *     (m = m_pullup(m, sizeof(struct ether_header)+sizeof(struct ip)))
-		 *     == NULL)
-		 * 	return (0);
-		 */
-		ip4hdr = mtodo(m, ETHER_HDR_LEN);
+		if ( (*m)->m_len < sizeof(struct ether_header)+sizeof(struct ip) &&
+		    (*m = m_pullup(*m, sizeof(struct ether_header)+sizeof(struct ip)))
+		    == NULL)
+			return (0);
+
+		ip4hdr = mtodo(*m, ETHER_HDR_LEN);
 
 		return ( INADDR_HASHVAL(ip4hdr->ip_src.s_addr)
 			^INADDR_HASHVAL(ip4hdr->ip_dst.s_addr));
 	break;
 	case ETHERTYPE_IPV6:
-		/* Assume someone done it for us
-		 * if ( m->m_len < sizeof(struct ether_header)+sizeof(struct ip6_hdr) &&
-		 *     (m = m_pullup(m, sizeof(struct ether_header)+sizeof(struct ip6_hdr)))
-		 *     == NULL)
-		 * 	return (0);
-		 */
-		ip6hdr = mtodo(m, ETHER_HDR_LEN);
+		if ( (*m)->m_len < sizeof(struct ether_header)+sizeof(struct ip6_hdr) &&
+		    (*m = m_pullup(*m, sizeof(struct ether_header)+sizeof(struct ip6_hdr)))
+		    == NULL)
+			return (0);
+
+		ip6hdr = mtodo(*m, ETHER_HDR_LEN);
 
 		return ( IN6ADDR_HASHVAL(&ip6hdr->ip6_src)
 			^IN6ADDR_HASHVAL(&ip6hdr->ip6_dst));
@@ -508,18 +505,21 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		pipe_dequeue(hinfo, now);
 		return (0);
 	}
+
+	if (hinfo->cfg.fifo)
+		hash = 0;	/* all packets go into a single FIFO queue */
+	else {
+		hash = ip_hash(&m) & NGPL_HMASK;
+		if (m == NULL) /* ip_hash() couldnt pullup and freed mbuf */
+			return (ENOBUFS);
+	}
+
 	/* Populate the packet header */
 	ngpl_h = uma_zalloc(ngpl_zone, M_NOWAIT);
 	KASSERT((ngpl_h != NULL), ("ngpl_h zalloc failed (1)"));
 	ngpl_h->m = m;
 
-	if (hinfo->cfg.fifo)
-		hash = 0;	/* all packets go into a single FIFO queue */
-	else
-		hash = ip_hash(m) & NGPL_HMASK;
-
 	/* Find the appropriate FIFO queue for the packet and enqueue it*/
-
 	ngpl_f = hinfo->fifo_array[hash];
 
 	if (ngpl_f == NULL) {
@@ -628,27 +628,27 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 			hinfo->run.fifo_queues--;
 		}
 
-                NG_SEND_DATA_ONLY(error, dest->hook, m);
+		NG_SEND_DATA_ONLY(error, dest->hook, m);
 
-                if (!error) {
-                        hinfo->stats.fwd_frames++;
-                        hinfo->stats.fwd_octets += psize;
+		if (!error) {
+			hinfo->stats.fwd_frames++;
+			hinfo->stats.fwd_octets += psize;
 			/* Decrement tokens */
 			hinfo->run.tc -= psize;
-                }
+		}
 	}
 
 	if (hinfo->run.qin_frames) {
-          if (!priv->timer_scheduled) {
-		ng_callout(&priv->timer, node, NULL, 1, ngpl_callout, NULL, 0);
-		priv->timer_scheduled = 1;
-          }
-	} else { /* We have empty queue. Cancel callout. */
-          if (priv->timer_scheduled) {
-            ng_uncallout(&priv->timer, node);
-            priv->timer_scheduled = 0;
-          }
-        }
+		if (!priv->timer_scheduled) {
+			ng_callout(&priv->timer, node, NULL, 1, ngpl_callout, NULL, 0);
+			priv->timer_scheduled = 1;
+		}
+	} else if (!priv->upper.run.qin_frames
+		 &&!priv->lower.run.qin_frames
+		 &&priv->timer_scheduled) {
+			ng_uncallout(&priv->timer, node);
+			priv->timer_scheduled = 0;
+	}
 }
 
 /*
