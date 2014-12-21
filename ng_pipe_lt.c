@@ -1,7 +1,7 @@
 /*-
  * Copyright (c) 2004-2010 University of Zagreb
  * Copyright (c) 2007-2008 FreeBSD Foundation
- * Copyright (c) 2014-2014 Dmitry Petuhov <mityapetuhov@gmail.com>
+ * Copyright (c) 2014 Dmitry Petuhov <mityapetuhov@gmail.com>
  *
  * This software was developed by the University of Zagreb and the
  * FreeBSD Foundation under sponsorship by the Stichting NLnet and the
@@ -37,7 +37,7 @@
  */
 
 /* temporary for debug */
-#define NETGRAPH_DEBUG 1
+//#define NETGRAPH_DEBUG 1
 #include <sys/syslog.h>
 
 #include <sys/param.h>
@@ -722,6 +722,11 @@ ngpl_disconnect(hook_p hook)
 		hinfo->fifo_array[ngpl_f->hash] = NULL;
 		uma_zfree(ngpl_zone, ngpl_f);
 	}
+
+	/* Autoshutdown on last hook  disconnect */
+	if ((NG_NODE_NUMHOOKS(NG_HOOK_NODE(hook)) == 0)
+		&& (NG_NODE_IS_VALID(NG_HOOK_NODE(hook)))) /* already shutting down? */
+			ng_rmnode_self(NG_HOOK_NODE(hook));
 
 	return (0);
 }
