@@ -121,8 +121,9 @@ static void	pipe_dequeue(struct hookinfo *, struct timeval *);
 static void	ngpl_callout(node_p, hook_p, void *, int);
 static int	ngpl_modevent(module_t, int, void *);
 
-/* zone for storing ngpl_hdr-s */
-static uma_zone_t ngpl_zone;
+/* zones for storing ngpl_hdr-s and ngpl_fifo-s*/
+static uma_zone_t ngpl_zone_hdr;
+static uma_zone_t ngpl_zone_fifo;
 
 /* Netgraph methods */
 static ng_constructor_t	ngpl_constructor;
@@ -515,7 +516,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	}
 
 	/* Populate the packet header */
-	ngpl_h = uma_zalloc(ngpl_zone, M_NOWAIT);
+	ngpl_h = uma_zalloc(ngpl_zone_hdr, M_NOWAIT);
 	KASSERT((ngpl_h != NULL), ("ngpl_h zalloc failed (1)"));
 	ngpl_h->m = m;
 
@@ -523,7 +524,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	ngpl_f = hinfo->fifo_array[hash];
 
 	if (ngpl_f == NULL) {
-		ngpl_f = uma_zalloc(ngpl_zone, M_NOWAIT);
+		ngpl_f = uma_zalloc(ngpl_zone_fifo, M_NOWAIT);
 		KASSERT(ngpl_h != NULL, ("ngpl_h zalloc failed (2)"));
 		hinfo->fifo_array[hash] = ngpl_f;
 		TAILQ_INIT(&ngpl_f->packet_head);
@@ -616,7 +617,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 
 		/* Actually dequeue packet */
 		TAILQ_REMOVE(&ngpl_f->packet_head, ngpl_h, ngpl_link);
-		uma_zfree(ngpl_zone, ngpl_h);
+		uma_zfree(ngpl_zone_hdr, ngpl_h);
 		hinfo->run.qin_frames--;
 		hinfo->run.qin_octets -= psize;
 		ngpl_f->packets--;
@@ -624,7 +625,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 		if (!ngpl_f->packets) {
 			TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
 			hinfo->fifo_array[ngpl_f->hash] = NULL;
-			uma_zfree(ngpl_zone, ngpl_f);
+			uma_zfree(ngpl_zone_fifo, ngpl_f);
 			hinfo->run.fifo_queues--;
 		}
 
@@ -716,11 +717,11 @@ ngpl_disconnect(hook_p hook)
 		while ((ngpl_h = TAILQ_FIRST(&ngpl_f->packet_head))) {
 			TAILQ_REMOVE(&ngpl_f->packet_head, ngpl_h, ngpl_link);
 			NG_FREE_M(ngpl_h->m);
-			uma_zfree(ngpl_zone, ngpl_h);
+			uma_zfree(ngpl_zone_hdr, ngpl_h);
 		}
 		TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
 		hinfo->fifo_array[ngpl_f->hash] = NULL;
-		uma_zfree(ngpl_zone, ngpl_f);
+		uma_zfree(ngpl_zone_fifo, ngpl_f);
 	}
 
 	/* Autoshutdown on last hook  disconnect */
@@ -738,14 +739,18 @@ ngpl_modevent(module_t mod, int type, void *unused)
 
 	switch (type) {
 	case MOD_LOAD:
-		ngpl_zone = uma_zcreate("ng_pipe_lite", max(sizeof(struct ngpl_hdr),
-		    sizeof (struct ngpl_fifo)), NULL, NULL, NULL, NULL,
-		    UMA_ALIGN_PTR, 0);
-		if (ngpl_zone == NULL)
-			panic("ng_pipe_lt: couldn't allocate descriptor zone");
+		ngpl_zone_hdr = uma_zcreate("ng_pipe_lite_hdr", sizeof(struct ngpl_hdr),
+			NULL, NULL, NULL, NULL, UMA_ALIGN_PTR, 0);
+		if (ngpl_zone_hdr == NULL)
+			panic("ng_pipe_lt: couldn't allocate descriptor zone for hdr's");
+		ngpl_zone_fifo = uma_zcreate("ng_pipe_lite_fifo", sizeof (struct ngpl_fifo),
+			NULL, NULL, NULL, NULL, UMA_ALIGN_PTR, 0);
+		if (ngpl_zone_fifo == NULL)
+			panic("ng_pipe_lt: couldn't allocate descriptor zone for FIFOs");
 		break;
 	case MOD_UNLOAD:
-		uma_zdestroy(ngpl_zone);
+		uma_zdestroy(ngpl_zone_hdr);
+		uma_zdestroy(ngpl_zone_fifo);
 		break;
 	default:
 		error = EOPNOTSUPP;
