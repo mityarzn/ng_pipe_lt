@@ -566,24 +566,24 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	u_int64_t psize;
         u_int32_t cbs = hinfo->cfg.bandwidth/8;
 
-        /*
-         * Refill token bucket. Once per run, because I'm sure it will not refill
-         * again.
-         */
-        timediff = *now;
-        timevalsub(&timediff,&hinfo->last_refill);
-        if (timevalisset(&timediff)) { /* At least ont tick since last refill */
-          if (timediff.tv_sec == 0) {
-            hinfo->run.tc += (cbs*timediff.tv_usec/1000000 );
-            /* We have hardcoded max tokens for one second on max bandwidth.*/
-            if (hinfo->run.tc > cbs) {
-		hinfo->run.tc = cbs;
-	    }
-          } else {
-		hinfo->run.tc = cbs;
-	  }
-        }
-        hinfo->last_refill = *now;
+	/*
+	 * Refill token bucket. Once per run, because I'm sure it will not refill
+	 * again.
+	 */
+	timediff = *now;
+	timevalsub(&timediff,&hinfo->last_refill);
+	if (timevalisset(&timediff)) { /* At least ont tick since last refill */
+		if (timediff.tv_sec == 0) {
+			hinfo->run.tc += (cbs*timediff.tv_usec/1000000 );
+		/* We have hardcoded max tokens for one second on max bandwidth.*/
+			if (hinfo->run.tc > cbs) {
+				hinfo->run.tc = cbs;
+			}
+		} else {
+			hinfo->run.tc = cbs;
+		}
+		hinfo->last_refill = *now;
+	}
 
 	/* Which one is the destination hook? */
 	if (hinfo == &priv->lower)
