@@ -475,6 +475,48 @@ ip_hash(struct mbuf **m)
 
 }
 
+static inline void
+hook_refill(struct hookinfo *hinfo, struct timeval *now)
+{
+	struct timeval timediff;
+        u_int32_t cbs = hinfo->cfg.bandwidth/8;
+
+	/*
+	 * Refill token bucket. Once per tick, because I'm sure it will not refill
+	 * again.
+	 */
+	timediff = *now;
+	timevalsub(&timediff,&hinfo->last_refill);
+	if (timevalisset(&timediff)) { /* At least one tick since last refill */
+		if (timediff.tv_sec == 0) {
+			hinfo->run.tc += (cbs*timediff.tv_usec/1000000 );
+		/* We have hardcoded max tokens for one second on max bandwidth. */
+			if (hinfo->run.tc > cbs) {
+				hinfo->run.tc = cbs;
+			}
+		} else {
+			hinfo->run.tc = cbs;
+		}
+		hinfo->last_refill = *now;
+	}
+}
+
+static inline void
+process_callout(struct hookinfo *hinfo, priv_p priv, node_p node)
+{
+	if (hinfo->run.qin_frames) {
+		if (!priv->timer_scheduled) {
+			ng_callout(&priv->timer, node, NULL, 1, ngpl_callout, NULL, 0);
+			priv->timer_scheduled = 1;
+		}
+	} else if (!priv->upper.run.qin_frames
+		 &&!priv->lower.run.qin_frames
+		 &&priv->timer_scheduled) {
+			ng_uncallout(&priv->timer, node);
+			priv->timer_scheduled = 0;
+	}
+}
+
 /*
  * Receive data on a hook - both in upstream and downstream direction.
  * We put the frame on the inbound queue, and try to initiate dequeuing
@@ -483,14 +525,16 @@ ip_hash(struct mbuf **m)
 int
 ngpl_rcvdata(hook_p hook, item_p item)
 {
-	struct hookinfo *const hinfo = NG_HOOK_PRIVATE(hook);
-/* unused	const priv_p priv = NG_NODE_PRIVATE(NG_HOOK_NODE(hook)); */
+	struct hookinfo * hinfo = NG_HOOK_PRIVATE(hook);
+	const priv_p priv = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
+	const node_p node = NG_HOOK_NODE(hinfo->hook);
 	struct timeval uuptime;
 	struct timeval *now = &uuptime;
 	struct ngpl_fifo *ngpl_f = NULL;
 	struct ngpl_hdr *ngpl_h = NULL;
 	struct mbuf *m;
 	uint32_t hash;
+	u_int64_t psize;
 
 	getmicrouptime(now);
 
@@ -498,13 +542,44 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	KASSERT(m != NULL, ("NGI_GET_M failed"));
 	NG_FREE_ITEM(item);
 
-	/* Discard THIS frame if inbound queue limit has been reached */
+	psize = m->m_pkthdr.len;
+
+	/* First, try to dequeue frames from queue(s) if any. Or at least refill tokens */
+	if (hinfo->run.qin_frames) {
+		pipe_dequeue(hinfo, now);
+	} else {
+		hook_refill(hinfo, now);
+	}
+
+	/* Discard THIS frame if inbound queue limit is still reached. */
 	if (hinfo->run.qin_frames >= hinfo->cfg.qin_size_limit) {
-		hinfo->stats.in_disc_octets += m->m_pkthdr.len;
+		hinfo->stats.in_disc_octets += psize;
 		hinfo->stats.in_disc_frames++;
 		NG_FREE_M(m);
-		pipe_dequeue(hinfo, now);
 		return (0);
+	}
+
+	/* If queue is empty and there's enough tokens, just forward frame, don't enqueue it.
+	 */
+	if ((!hinfo->run.qin_frames) && hinfo->run.tc >= psize) {
+		int error = 0;
+		struct hookinfo *dest;
+
+		/* Which one is the destination hook? */
+		if (hinfo == &priv->lower)
+			dest = &priv->upper;
+		else
+			dest = &priv->lower;
+
+		NG_SEND_DATA_ONLY(error, dest->hook, m);
+
+		if (!error) {
+			hinfo->stats.fwd_frames++;
+			hinfo->stats.fwd_octets += psize;
+			/* Decrement tokens */
+			hinfo->run.tc -= psize;
+		}
+		return(error);
 	}
 
 	if (hinfo->cfg.fifo)
@@ -539,12 +614,9 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		ngpl_f->packets++;
 	}
 	hinfo->run.qin_frames++;
-	hinfo->run.qin_octets += m->m_pkthdr.len;
+	hinfo->run.qin_octets += psize;
 
-	/*
-	 * Try to start the dequeuing process immediately.
-	 */
-	pipe_dequeue(hinfo, now);
+	process_callout(hinfo, priv, node);
 
 	return (0);
 }
@@ -561,30 +633,11 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	struct hookinfo *dest;
 	struct ngpl_fifo *ngpl_f;
 	struct ngpl_hdr *ngpl_h;
-	struct timeval timediff;
 	struct mbuf *m;
 	int error = 0;
 	u_int64_t psize;
-        u_int32_t cbs = hinfo->cfg.bandwidth/8;
 
-	/*
-	 * Refill token bucket. Once per run, because I'm sure it will not refill
-	 * again.
-	 */
-	timediff = *now;
-	timevalsub(&timediff,&hinfo->last_refill);
-	if (timevalisset(&timediff)) { /* At least ont tick since last refill */
-		if (timediff.tv_sec == 0) {
-			hinfo->run.tc += (cbs*timediff.tv_usec/1000000 );
-		/* We have hardcoded max tokens for one second on max bandwidth.*/
-			if (hinfo->run.tc > cbs) {
-				hinfo->run.tc = cbs;
-			}
-		} else {
-			hinfo->run.tc = cbs;
-		}
-		hinfo->last_refill = *now;
-	}
+	hook_refill(hinfo, now);
 
 	/* Which one is the destination hook? */
 	if (hinfo == &priv->lower)
@@ -639,17 +692,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 		}
 	}
 
-	if (hinfo->run.qin_frames) {
-		if (!priv->timer_scheduled) {
-			ng_callout(&priv->timer, node, NULL, 1, ngpl_callout, NULL, 0);
-			priv->timer_scheduled = 1;
-		}
-	} else if (!priv->upper.run.qin_frames
-		 &&!priv->lower.run.qin_frames
-		 &&priv->timer_scheduled) {
-			ng_uncallout(&priv->timer, node);
-			priv->timer_scheduled = 0;
-	}
+	process_callout(hinfo, priv, node);
 }
 
 /*
