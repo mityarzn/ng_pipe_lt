@@ -80,6 +80,7 @@ in6_addrhash(struct in6_addr *in6)
 /* Packet header struct */
 struct ngpl_hdr {
 	TAILQ_ENTRY(ngpl_hdr)	ngpl_link;	/* next pkt in queue */
+	item_p			item;		/* ptr to netgraph internal decriptor */
 	struct mbuf		*m;		/* ptr to the packet data */
 };
 TAILQ_HEAD(p_head, ngpl_hdr);
@@ -540,7 +541,6 @@ ngpl_rcvdata(hook_p hook, item_p item)
 
 	NGI_GET_M(item, m);
 	KASSERT(m != NULL, ("NGI_GET_M failed"));
-	NG_FREE_ITEM(item);
 
 	psize = m->m_pkthdr.len;
 
@@ -555,6 +555,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	if (hinfo->run.qin_frames >= hinfo->cfg.qin_size_limit) {
 		hinfo->stats.in_disc_octets += psize;
 		hinfo->stats.in_disc_frames++;
+		NG_FREE_ITEM(item);
 		NG_FREE_M(m);
 		return (0);
 	}
@@ -571,7 +572,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		else
 			dest = &priv->lower;
 
-		NG_SEND_DATA_ONLY(error, dest->hook, m);
+		NG_FWD_NEW_DATA(error, item, dest->hook, m);
 
 		if (!error) {
 			hinfo->stats.fwd_frames++;
@@ -586,14 +587,17 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		hash = 0;	/* all packets go into a single FIFO queue */
 	else {
 		hash = ip_hash(&m) & NGPL_HMASK;
-		if (m == NULL) /* ip_hash() couldnt pullup and freed mbuf */
+		if (m == NULL) /* ip_hash() couldnt pullup and freed mbuf */ {
+			NG_FREE_ITEM(item);
 			return (ENOBUFS);
+		}
 	}
 
 	/* Populate the packet header */
 	ngpl_h = uma_zalloc(ngpl_zone_hdr, M_NOWAIT);
 	KASSERT((ngpl_h != NULL), ("ngpl_h zalloc failed (1)"));
 	ngpl_h->m = m;
+	ngpl_h->item = item;
 
 	/* Find the appropriate FIFO queue for the packet and enqueue it*/
 	ngpl_f = hinfo->fifo_array[hash];
@@ -633,6 +637,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	struct hookinfo *dest;
 	struct ngpl_fifo *ngpl_f;
 	struct ngpl_hdr *ngpl_h;
+	item_p item;
 	struct mbuf *m;
 	int error = 0;
 	u_int64_t psize;
@@ -648,6 +653,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	/* Bandwidth queue processing */
 	while ((ngpl_f = TAILQ_FIRST(&hinfo->fifo_head))) {
 		ngpl_h = TAILQ_FIRST(&ngpl_f->packet_head);
+		item = ngpl_h->item;
 		m = ngpl_h->m;
 		psize = m->m_pkthdr.len;
 
@@ -682,7 +688,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 			hinfo->run.fifo_queues--;
 		}
 
-		NG_SEND_DATA_ONLY(error, dest->hook, m);
+		NG_FWD_NEW_DATA(error, item, dest->hook, m);
 
 		if (!error) {
 			hinfo->stats.fwd_frames++;
@@ -759,7 +765,7 @@ ngpl_disconnect(hook_p hook)
 	while ((ngpl_f = TAILQ_FIRST(&hinfo->fifo_head))) {
 		while ((ngpl_h = TAILQ_FIRST(&ngpl_f->packet_head))) {
 			TAILQ_REMOVE(&ngpl_f->packet_head, ngpl_h, ngpl_link);
-			NG_FREE_M(ngpl_h->m);
+			NG_FREE_ITEM(ngpl_h->item); /* it also frees mbuf */
 			uma_zfree(ngpl_zone_hdr, ngpl_h);
 		}
 		TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
