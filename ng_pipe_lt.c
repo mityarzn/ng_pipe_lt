@@ -75,7 +75,7 @@ in6_addrhash(struct in6_addr *in6)
 }
 #define IN6ADDR_HASHVAL(x)	(in6_addrhash(x))
 
-#define NGPL_HMASK	0x1f
+#define NGPL_QUEUES	32
 
 /* Packet header struct */
 struct ngpl_hdr {
@@ -99,8 +99,8 @@ struct hookinfo {
 	hook_p			hook;
 	int			noqueue;	/* bypass any processing */
 	TAILQ_HEAD(, ngpl_fifo)	fifo_head;	/* FIFO queues */
-	struct ngpl_fifo 	*fifo_array[NGPL_HMASK+1]; /* array of same FIFO queues */
-	struct timeval		qin_utime;
+	struct ngpl_fifo 	*fifo_array[NGPL_QUEUES]; /* array of same FIFO queues */
+	struct ngpl_fifo	*ackq;		/* Separate queue for TCK ACKs */
 	struct ng_pipe_hookcfg	cfg;
 	struct ng_pipe_hookrun	run;
 	struct ng_pipe_hookstat	stats;
@@ -553,15 +553,12 @@ ngpl_rcvdata(hook_p hook, item_p item)
 
 	/* If queue is empty and there's enough tokens, just forward frame, don't enqueue it.
 	 */
-	if ((!hinfo->run.qin_frames) && hinfo->run.tc >= psize) {
+	if (((!hinfo->run.qin_frames) && hinfo->run.tc >= psize) || hinfo->noqueue) {
 		int error = 0;
 		struct hookinfo *dest;
 
 		/* Which one is the destination hook? */
-		if (hinfo == &priv->lower)
-			dest = &priv->upper;
-		else
-			dest = &priv->lower;
+		dest = (hinfo == &priv->lower)?(&priv->upper):(&priv->lower);
 
 		NG_FWD_NEW_DATA(error, item, dest->hook, m);
 
@@ -577,7 +574,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	if (hinfo->cfg.fifo)
 		hash = 0;	/* all packets go into a single FIFO queue */
 	else {
-		hash = ip_hash(&m) & NGPL_HMASK;
+		hash = ip_hash(&m) ^ NGPL_QUEUES;
 		if (m == NULL) /* ip_hash() couldnt pullup and freed mbuf */ {
 			NG_FREE_ITEM(item);
 			return (ENOBUFS);
@@ -645,10 +642,7 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 	hook_refill(hinfo, now);
 
 	/* Which one is the destination hook? */
-	if (hinfo == &priv->lower)
-		dest = &priv->upper;
-	else
-		dest = &priv->lower;
+	dest = (hinfo == &priv->lower)?(&priv->upper):(&priv->lower);
 
 	/* Bandwidth queue processing */
 	while ((ngpl_f = TAILQ_FIRST(&hinfo->fifo_head))) {
