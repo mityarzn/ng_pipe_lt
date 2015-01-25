@@ -551,15 +551,6 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		hook_refill(hinfo, now);
 	}
 
-	/* Discard THIS frame if inbound queue limit is still reached. */
-	if (hinfo->run.qin_frames >= hinfo->cfg.qin_size_limit) {
-		hinfo->stats.in_disc_octets += psize;
-		hinfo->stats.in_disc_frames++;
-		NG_FREE_ITEM(item);
-		NG_FREE_M(m);
-		return (0);
-	}
-
 	/* If queue is empty and there's enough tokens, just forward frame, don't enqueue it.
 	 */
 	if ((!hinfo->run.qin_frames) && hinfo->run.tc >= psize) {
@@ -614,6 +605,15 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
 		TAILQ_INSERT_TAIL(&hinfo->fifo_head, ngpl_f, fifo_le);
 	} else {
+		/* Discard THIS frame if inbound queue limit is still reached. */
+		if (ngpl_f->packets >= hinfo->cfg.qin_size_limit) {
+			hinfo->stats.in_disc_octets += psize;
+			hinfo->stats.in_disc_frames++;
+			NG_FREE_ITEM(item);
+			NG_FREE_M(m);
+			return (0);
+		}
+
 		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
 		ngpl_f->packets++;
 	}
