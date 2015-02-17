@@ -53,6 +53,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
+#include <netinet/tcp.h>
 #include <net/ethernet.h>
 
 #include <netgraph/ng_message.h>
@@ -425,6 +426,21 @@ parse_cfg(struct ng_pipe_hookcfg *current, struct ng_pipe_hookcfg *new,
 }
 
 /*
+ * Try to pullup mbuf to desired len, but first ceck if len < MHLEN.
+ * May reallocate/destroy mbuf.
+ * Returns 0 if limit reached, 1 otherwise.
+ */
+static inline int
+try_pullup(struct mbuf **m, int len)
+{
+	if (len > MHLEN)
+		return 0;
+	if ((*m)->m_len < len)
+		*m = m_pullup(*m, len);
+	return 1;
+}
+
+/*
  * Compute a hash signature for a packet. Used system-wide hash functions
  * for IP v4 and v6. Here we expecting not-vlan-tagged Ethernet frames with IP
  * payload. For anything else it will return zero.
@@ -474,6 +490,96 @@ ip_hash(struct mbuf **m)
 		return 0;
 	}
 
+}
+
+/*
+ * Check if packet is TCP ACK. Here we expecting not-vlan-tagged Ethernet frames with IP
+ * payload. For anything else it will return zero.
+ */
+static int
+is_ack(struct mbuf **m)
+{
+	int off = 0;
+	struct ether_header *eh;
+	struct ip      *ip4hdr;
+	struct ip6_hdr *ip6hdr;
+	//uint16_t src_port = 0, dst_port = 0;
+	uint8_t proto;
+	void *ulp = NULL;
+
+	if (!try_pullup(m, sizeof(*eh))) {
+	 	return (0);
+	}
+
+	eh = mtod(*m, struct ether_header *);
+	off += sizeof(*eh);
+
+#define	TCP(p)	((struct tcphdr *)(p))
+#define	UDP(p)	((struct udphdr *)(p))
+
+	/* Determine IP version and make corresponding hash.
+	 * Fallback to zero if not successfull. */
+	switch (ntohs(eh->ether_type)) {
+	case ETHERTYPE_IP:
+		if (!try_pullup(m, off+sizeof(*ip4hdr))||*m==NULL)
+			return (0);
+
+		ip4hdr = mtodo(*m, off);
+		if (ip4hdr->ip_p == IPPROTO_TCP) {
+			off += ip4hdr->ip_hl*4;
+
+			if (!try_pullup(m, off+sizeof(struct tcphdr))||*m==NULL)
+				return (0);
+
+			ulp = mtodo(*m, off);
+			return (TCP(ulp)->th_flags & TH_ACK)?1:0;
+		}
+
+	break;
+	case ETHERTYPE_IPV6:
+		if (!try_pullup(m,  off+sizeof(*ip6hdr)))
+			return (0);
+
+		ip6hdr = mtodo(*m, off);
+		off += sizeof(*ip6hdr);
+		proto = ip6hdr->ip6_nxt;
+		/*
+		 * Here we're trying to find TCP or UDP headers. If there's extension
+		 * headers, skip them and stop on unknown headers and other protocols.
+		 * Also make sure that we're not going beyond MHLEN (we could in some
+		 * rare cases).
+		 */
+		while (ulp == NULL) {
+			ulp = mtodo(*m, off);
+			switch (proto) {
+			case IPPROTO_HOPOPTS: /* just skip it */
+				if (!try_pullup(m,  off+sizeof(struct ip6_hbh))||*m==NULL)
+					return (0);
+				off += ((((struct ip6_hbh *)ulp)->ip6h_len + 1) << 3);
+				proto = ((struct ip6_hbh *)ulp)->ip6h_nxt;
+				ulp = NULL;
+			break;
+
+			case IPPROTO_ROUTING: /* just skip it */
+				if (!try_pullup(m,  off+sizeof(struct ip6_rthdr))||*m==NULL)
+					return (0);
+				off += ((((struct ip6_rthdr *)ulp)->ip6r_len + 1) << 3);
+				proto = ((struct ip6_rthdr *)ulp)->ip6r_nxt;
+				ulp = NULL;
+			break;
+
+			case IPPROTO_TCP:
+				if (!try_pullup(m,  off+sizeof(struct tcphdr))||*m==NULL)
+					return (0);
+				return (TCP(ulp)->th_flags & TH_ACK)?1:0;
+			break;
+			/* Currently ignore all other */
+			}
+		}
+
+	break;
+	}
+	return 0;
 }
 
 static inline void
