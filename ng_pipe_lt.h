@@ -110,6 +110,7 @@ struct ng_pipe_hookcfg {
 	u_int32_t		qin_size_limit;
 	u_int32_t		fifo;
 	u_int32_t		drr;
+	u_int32_t		prioritize_acks;
 };
 
 /* Keep this in sync with the above structure definition */
@@ -118,13 +119,13 @@ struct ng_pipe_hookcfg {
 	{ "queuelen",		&ng_parse_uint32_type	},		\
 	{ "fifo",		&ng_parse_uint32_type	},		\
 	{ "drr",		&ng_parse_uint32_type	},		\
+	{ "prioritize_acks",	&ng_parse_uint32_type	},		\
 	{ NULL },							\
 }
 
 /* Config structure returned by NGM_PIPE_GET_CFG */
 struct ng_pipe_cfg {
 	u_int64_t		bandwidth;
-	u_int32_t		overhead;
 	struct ng_pipe_hookcfg	downstream;
 	struct ng_pipe_hookcfg	upstream;
 };
@@ -132,7 +133,6 @@ struct ng_pipe_cfg {
 /* Keep this in sync with the above structure definition */
 #define NG_PIPE_CFG_INFO(hstype)	{				\
 	{ "bandwidth",		&ng_parse_uint64_type	},		\
-	{ "overhead",		&ng_parse_uint32_type	},		\
 	{ "downstream",		(hstype)		},		\
 	{ "upstream",		(hstype)		},		\
 	{ NULL },							\

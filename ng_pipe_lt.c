@@ -412,6 +412,9 @@ parse_cfg(struct ng_pipe_hookcfg *current, struct ng_pipe_hookcfg *new,
 			current->drr = 2048;		/* default quantum */
 	}
 
+	if (new->prioritize_acks)
+		current->prioritize_acks = 1;
+
 	if (new->bandwidth == -1) {
 		current->bandwidth = 0;
 		current->fifo = 1;
@@ -441,106 +444,86 @@ try_pullup(struct mbuf **m, int len)
 }
 
 /*
- * Compute a hash signature for a packet. Used system-wide hash functions
- * for IP v4 and v6. Here we expecting not-vlan-tagged Ethernet frames with IP
- * payload. For anything else it will return zero.
- */
-static uint32_t
-ip_hash(struct mbuf **m)
-{
-	struct ether_header *eh;
-	struct ip      *ip4hdr;
-	struct ip6_hdr *ip6hdr;
-
-
-	 if ( (*m)->m_len < sizeof(struct ether_header) &&
-	     (*m = m_pullup(*m, sizeof(struct ether_header))) == NULL) {
-	 	return (0);
-	 }
-
-	eh = mtod(*m, struct ether_header *);
-
-	/* Determine IP version and make corresponding hash.
-	 * Fallback to zero if not successfull. */
-	switch (ntohs(eh->ether_type)) {
-	case ETHERTYPE_IP:
-		if ( (*m)->m_len < sizeof(struct ether_header)+sizeof(struct ip) &&
-		    (*m = m_pullup(*m, sizeof(struct ether_header)+sizeof(struct ip)))
-		    == NULL)
-			return (0);
-
-		ip4hdr = mtodo(*m, ETHER_HDR_LEN);
-
-		return ( INADDR_HASHVAL(ip4hdr->ip_src.s_addr)
-			^INADDR_HASHVAL(ip4hdr->ip_dst.s_addr));
-	break;
-	case ETHERTYPE_IPV6:
-		if ( (*m)->m_len < sizeof(struct ether_header)+sizeof(struct ip6_hdr) &&
-		    (*m = m_pullup(*m, sizeof(struct ether_header)+sizeof(struct ip6_hdr)))
-		    == NULL)
-			return (0);
-
-		ip6hdr = mtodo(*m, ETHER_HDR_LEN);
-
-		return ( IN6ADDR_HASHVAL(&ip6hdr->ip6_src)
-			^IN6ADDR_HASHVAL(&ip6hdr->ip6_dst));
-	break;
-	default:
-	/* Not IPv4 or IPv6 */
-		return 0;
-	}
-
-}
-
-/*
  * Check if packet is TCP ACK. Here we expecting not-vlan-tagged Ethernet frames with IP
  * payload. For anything else it will return zero.
  */
 static int
-is_ack(struct mbuf **m)
+ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 {
 	int off = 0;
+	uint32_t hash = 0;
 	struct ether_header *eh;
 	struct ip      *ip4hdr;
 	struct ip6_hdr *ip6hdr;
 	//uint16_t src_port = 0, dst_port = 0;
 	uint8_t proto;
+	int prepend = 0;
 	void *ulp = NULL;
+	struct ngpl_fifo *ngpl_f = NULL;
+	struct ngpl_hdr *ngpl_h = NULL;
 
-	if (!try_pullup(m, sizeof(*eh))) {
-	 	return (0);
-	}
+	int psize = m->m_pkthdr.len;
 
-	eh = mtod(*m, struct ether_header *);
+	/* First, check if we need to do anything. */
+	if (hinfo->cfg.fifo && !hinfo->cfg.prioritize_acks)
+		goto enqueue;
+	
+	if (!try_pullup(&m, off+sizeof(*eh))) {
+		goto enqueue;
+	} else if (m==NULL)
+		{ NG_FREE_ITEM(item); return 0; };
+
+	eh = mtod(m, struct ether_header *);
 	off += sizeof(*eh);
 
 #define	TCP(p)	((struct tcphdr *)(p))
 #define	UDP(p)	((struct udphdr *)(p))
 
-	/* Determine IP version and make corresponding hash.
-	 * Fallback to zero if not successfull. */
 	switch (ntohs(eh->ether_type)) {
 	case ETHERTYPE_IP:
-		if (!try_pullup(m, off+sizeof(*ip4hdr))||*m==NULL)
-			return (0);
+		if (!try_pullup(&m, off+sizeof(*ip4hdr))) {
+			goto enqueue;
+		} else if (m==NULL)
+			{ NG_FREE_ITEM(item); return 0; };
 
-		ip4hdr = mtodo(*m, off);
-		if (ip4hdr->ip_p == IPPROTO_TCP) {
-			off += ip4hdr->ip_hl*4;
+		ip4hdr = mtodo(m, off);
+		
+		if (hinfo->cfg.drr)
+			hash =  ( INADDR_HASHVAL(ip4hdr->ip_src.s_addr)
+				 ^INADDR_HASHVAL(ip4hdr->ip_dst.s_addr))
+				% NGPL_QUEUES;
+		
+		if (hinfo->cfg.prioritize_acks) {
+			if (ip4hdr->ip_p == IPPROTO_TCP) {
+				off += ip4hdr->ip_hl*4;
 
-			if (!try_pullup(m, off+sizeof(struct tcphdr))||*m==NULL)
-				return (0);
+				ulp = mtodo(m, off);
+				if (try_pullup(&m, off+sizeof(struct tcphdr))) {
+					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
 
-			ulp = mtodo(*m, off);
-			return (TCP(ulp)->th_flags & TH_ACK)?1:0;
+					if (	(TCP(ulp)->th_flags & TH_ACK) &&
+						(psize < 100)
+					){
+						prepend = 1;
+					}
+				}
+			}
 		}
 
 	break;
 	case ETHERTYPE_IPV6:
-		if (!try_pullup(m,  off+sizeof(*ip6hdr)))
-			return (0);
+		if (!try_pullup(&m,  off+sizeof(*ip6hdr))) {
+			goto enqueue;
+		} else if (m==NULL)
+			{ NG_FREE_ITEM(item); return 0; };
 
-		ip6hdr = mtodo(*m, off);
+		ip6hdr = mtodo(m, off);
+		if (hinfo->cfg.drr)
+			hash =  ( IN6ADDR_HASHVAL(&ip6hdr->ip6_src)
+				 ^IN6ADDR_HASHVAL(&ip6hdr->ip6_dst))
+				% NGPL_QUEUES;
+
+		
 		off += sizeof(*ip6hdr);
 		proto = ip6hdr->ip6_nxt;
 		/*
@@ -550,28 +533,37 @@ is_ack(struct mbuf **m)
 		 * rare cases).
 		 */
 		while (ulp == NULL) {
-			ulp = mtodo(*m, off);
+			ulp = mtodo(m, off);
 			switch (proto) {
 			case IPPROTO_HOPOPTS: /* just skip it */
-				if (!try_pullup(m,  off+sizeof(struct ip6_hbh))||*m==NULL)
-					return (0);
-				off += ((((struct ip6_hbh *)ulp)->ip6h_len + 1) << 3);
-				proto = ((struct ip6_hbh *)ulp)->ip6h_nxt;
-				ulp = NULL;
+				if (try_pullup(&m,  off+sizeof(struct ip6_hbh))) {
+					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
+					
+					off += ((((struct ip6_hbh *)ulp)->ip6h_len + 1) << 3);
+					proto = ((struct ip6_hbh *)ulp)->ip6h_nxt;
+					ulp = NULL;
+				}
 			break;
 
 			case IPPROTO_ROUTING: /* just skip it */
-				if (!try_pullup(m,  off+sizeof(struct ip6_rthdr))||*m==NULL)
-					return (0);
-				off += ((((struct ip6_rthdr *)ulp)->ip6r_len + 1) << 3);
-				proto = ((struct ip6_rthdr *)ulp)->ip6r_nxt;
-				ulp = NULL;
+				if (!try_pullup(&m,  off+sizeof(struct ip6_rthdr))) {
+					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
+					
+					off += ((((struct ip6_rthdr *)ulp)->ip6r_len + 1) << 3);
+					proto = ((struct ip6_rthdr *)ulp)->ip6r_nxt;
+					ulp = NULL;
+				}
 			break;
 
 			case IPPROTO_TCP:
-				if (!try_pullup(m,  off+sizeof(struct tcphdr))||*m==NULL)
-					return (0);
-				return (TCP(ulp)->th_flags & TH_ACK)?1:0;
+				if (!try_pullup(&m,  off+sizeof(struct tcphdr))) {
+					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
+
+					if (TCP(ulp)->th_flags & TH_ACK &&
+						(psize < 100)) {
+						prepend = 1;
+					}
+				}
 			break;
 			/* Currently ignore all other */
 			}
@@ -579,6 +571,51 @@ is_ack(struct mbuf **m)
 
 	break;
 	}
+enqueue:
+	/* 
+	 * Now we have selected queue and determined toappend or to prepend packet
+	 * to queue. Do  it.
+	 */
+	ngpl_f = hinfo->fifo_array[hash];
+
+	if (ngpl_f == NULL) {
+		ngpl_f = uma_zalloc(ngpl_zone_fifo, M_NOWAIT);
+		KASSERT(ngpl_h != NULL, ("ngpl_h zalloc failed (2)"));
+		hinfo->fifo_array[hash] = ngpl_f;
+		TAILQ_INIT(&ngpl_f->packet_head);
+		ngpl_f->hash = hash;
+		ngpl_f->packets = 1;
+		ngpl_f->rr_deficit = hinfo->cfg.drr;	/* DRR quantum */
+		hinfo->run.fifo_queues++;
+		TAILQ_INSERT_TAIL(&hinfo->fifo_head, ngpl_f, fifo_le);
+	} else {
+		/* Discard THIS frame if inbound queue limit is still reached. */
+		if (ngpl_f->packets >= hinfo->cfg.qin_size_limit) {
+			hinfo->stats.in_disc_octets += psize;
+			hinfo->stats.in_disc_frames++;
+			NG_FREE_ITEM(item);
+			NG_FREE_M(m);
+			return (0);
+		}
+
+		
+		ngpl_f->packets++;
+	}
+	hinfo->run.qin_frames++;
+	hinfo->run.qin_octets += psize;
+
+	/* Populate the packet header */
+	ngpl_h = uma_zalloc(ngpl_zone_hdr, M_NOWAIT);
+	KASSERT((ngpl_h != NULL), ("ngpl_h zalloc failed (1)"));
+	ngpl_h->m = m;
+	ngpl_h->item = item;
+
+	if (prepend) {
+		TAILQ_INSERT_HEAD(&ngpl_f->packet_head, ngpl_h, ngpl_link);
+	} else {
+		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
+	}
+
 	return 0;
 }
 
@@ -637,10 +674,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	const node_p node = NG_HOOK_NODE(hinfo->hook);
 	struct timeval uuptime;
 	struct timeval *now = &uuptime;
-	struct ngpl_fifo *ngpl_f = NULL;
-	struct ngpl_hdr *ngpl_h = NULL;
 	struct mbuf *m;
-	uint32_t hash;
 	u_int64_t psize;
 
 	getmicrouptime(now);
@@ -677,51 +711,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 		return(error);
 	}
 
-	if (hinfo->cfg.fifo)
-		hash = 0;	/* all packets go into a single FIFO queue */
-	else {
-		hash = ip_hash(&m) ^ NGPL_QUEUES;
-		if (m == NULL) /* ip_hash() couldnt pullup and freed mbuf */ {
-			NG_FREE_ITEM(item);
-			return (ENOBUFS);
-		}
-	}
-
-	/* Populate the packet header */
-	ngpl_h = uma_zalloc(ngpl_zone_hdr, M_NOWAIT);
-	KASSERT((ngpl_h != NULL), ("ngpl_h zalloc failed (1)"));
-	ngpl_h->m = m;
-	ngpl_h->item = item;
-
-	/* Find the appropriate FIFO queue for the packet and enqueue it*/
-	ngpl_f = hinfo->fifo_array[hash];
-
-	if (ngpl_f == NULL) {
-		ngpl_f = uma_zalloc(ngpl_zone_fifo, M_NOWAIT);
-		KASSERT(ngpl_h != NULL, ("ngpl_h zalloc failed (2)"));
-		hinfo->fifo_array[hash] = ngpl_f;
-		TAILQ_INIT(&ngpl_f->packet_head);
-		ngpl_f->hash = hash;
-		ngpl_f->packets = 1;
-		ngpl_f->rr_deficit = hinfo->cfg.drr;	/* DRR quantum */
-		hinfo->run.fifo_queues++;
-		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
-		TAILQ_INSERT_TAIL(&hinfo->fifo_head, ngpl_f, fifo_le);
-	} else {
-		/* Discard THIS frame if inbound queue limit is still reached. */
-		if (ngpl_f->packets >= hinfo->cfg.qin_size_limit) {
-			hinfo->stats.in_disc_octets += psize;
-			hinfo->stats.in_disc_frames++;
-			NG_FREE_ITEM(item);
-			NG_FREE_M(m);
-			return (0);
-		}
-
-		TAILQ_INSERT_TAIL(&ngpl_f->packet_head, ngpl_h, ngpl_link);
-		ngpl_f->packets++;
-	}
-	hinfo->run.qin_frames++;
-	hinfo->run.qin_octets += psize;
+	ngpl_enqueue(hinfo, item, m);
 
 	process_callout(hinfo, priv, node);
 
