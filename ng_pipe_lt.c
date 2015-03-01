@@ -546,7 +546,7 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 			break;
 
 			case IPPROTO_ROUTING: /* just skip it */
-				if (!try_pullup(&m,  off+sizeof(struct ip6_rthdr))) {
+				if (try_pullup(&m,  off+sizeof(struct ip6_rthdr))) {
 					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
 					
 					off += ((((struct ip6_rthdr *)ulp)->ip6r_len + 1) << 3);
@@ -556,7 +556,7 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 			break;
 
 			case IPPROTO_TCP:
-				if (!try_pullup(&m,  off+sizeof(struct tcphdr))) {
+				if (try_pullup(&m,  off+sizeof(struct tcphdr))) {
 					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
 
 					if (TCP(ulp)->th_flags & TH_ACK &&
