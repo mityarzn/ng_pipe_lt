@@ -443,6 +443,19 @@ try_pullup(struct mbuf **m, int len)
 	return 1;
 }
 
+/* Function that tries to identify p2p packets by TCP/UDP ports */
+static inline int
+is_p2p(register uint16_t port, uint16_t proto)
+{
+	return (port > 6881 && port < 6999) || // Torrent ports
+	(port > 10000 && ( // High-order ports are often client-side, except some
+			    // well-known game servers ports:
+	(proto == IPPROTO_TCP && port != 20560 && port != 26000 && port != 26900 &&
+	 port != 26901)
+	||
+	(proto == IPPROTO_UDP && port != 20560 && port != 26000 && port != 28960 &&
+	 port != 29000 && (port < 27000 || port < 27999))));
+}
 /*
  * Check if packet is TCP ACK. Here we expecting not-vlan-tagged Ethernet frames with IP
  * payload. For anything else it will return zero.
@@ -573,8 +586,8 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 	}
 enqueue:
 	/* 
-	 * Now we have selected queue and determined toappend or to prepend packet
-	 * to queue. Do  it.
+	 * Now we have selected queue and determined to append or to prepend packet
+	 * to queue. Do it.
 	 */
 	ngpl_f = hinfo->fifo_array[hash];
 
