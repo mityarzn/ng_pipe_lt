@@ -79,7 +79,8 @@ struct ng_pipe_hookrun {
 	u_int32_t		fifo_queues;
 	u_int32_t		qin_octets;
 	u_int32_t		qin_frames;
-        u_int32_t               tc;
+	u_int32_t		tc;
+	u_int32_t		tc_p2p;
 };
 
 /* Keep this in sync with the above structure definition */
@@ -87,7 +88,8 @@ struct ng_pipe_hookrun {
 	{ "queues",		&ng_parse_uint32_type	},		\
 	{ "queuedOctets",	&ng_parse_uint32_type	},		\
 	{ "queuedFrames",	&ng_parse_uint32_type	},		\
-        { "currentTokens",      &ng_parse_uint32_type   },              \
+	{ "currentTokens",      &ng_parse_uint32_type   },		\
+	{ "currentTokensP2P",   &ng_parse_uint32_type   },		\
 	{ NULL },							\
 }
 
@@ -111,6 +113,7 @@ struct ng_pipe_hookcfg {
 	u_int32_t		fifo;
 	u_int32_t		drr;
 	u_int32_t		prioritize_acks;
+	u_int32_t		p2p_div;
 };
 
 /* Keep this in sync with the above structure definition */
@@ -120,6 +123,7 @@ struct ng_pipe_hookcfg {
 	{ "fifo",		&ng_parse_uint32_type	},		\
 	{ "drr",		&ng_parse_uint32_type	},		\
 	{ "prioritize_acks",	&ng_parse_uint32_type	},		\
+	{ "p2p_div",		&ng_parse_uint32_type	},		\
 	{ NULL },							\
 }
 

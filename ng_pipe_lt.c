@@ -54,6 +54,7 @@
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 #include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <net/ethernet.h>
 
 #include <netgraph/ng_message.h>
@@ -101,7 +102,7 @@ struct hookinfo {
 	int			noqueue;	/* bypass any processing */
 	TAILQ_HEAD(, ngpl_fifo)	fifo_head;	/* FIFO queues */
 	struct ngpl_fifo 	*fifo_array[NGPL_QUEUES]; /* array of same FIFO queues */
-	struct ngpl_fifo	*ackq;		/* Separate queue for TCK ACKs */
+	struct ngpl_fifo	*p2pq;		/* Separate queue for p2p traffic */
 	struct ng_pipe_hookcfg	cfg;
 	struct ng_pipe_hookrun	run;
 	struct ng_pipe_hookstat	stats;
@@ -123,7 +124,7 @@ static void	pipe_dequeue(struct hookinfo *, struct timeval *);
 static void	ngpl_callout(node_p, hook_p, void *, int);
 static int	ngpl_modevent(module_t, int, void *);
 
-/* zones for storing ngpl_hdr-s and ngpl_fifo-s*/
+/* zones for storing ngpl_hdr-s and ngpl_fifo-s */
 static uma_zone_t ngpl_zone_hdr;
 static uma_zone_t ngpl_zone_fifo;
 
@@ -415,6 +416,9 @@ parse_cfg(struct ng_pipe_hookcfg *current, struct ng_pipe_hookcfg *new,
 	if (new->prioritize_acks)
 		current->prioritize_acks = 1;
 
+	if (new->p2p_div)
+		current->p2p_div = 1;
+
 	if (new->bandwidth == -1) {
 		current->bandwidth = 0;
 		current->fifo = 1;
@@ -445,7 +449,7 @@ try_pullup(struct mbuf **m, int len)
 
 /* Function that tries to identify p2p packets by TCP/UDP ports */
 static inline int
- (register uint16_t port, uint16_t proto)
+is_p2p (register uint16_t port, uint16_t proto)
 {
 	return (port > 6881 && port < 6999) || // Torrent ports
 	(port > 10000 && ( // High-order ports are often client-side, except some
@@ -454,7 +458,7 @@ static inline int
 	 port != 26901)
 	||
 	(proto == IPPROTO_UDP && port != 20560 && port != 26000 && port != 28960 &&
-	 port != 29000 && port < 27000 && port > 27999))));
+	 port != 29000 && port < 27000 && port > 27999)));
 }
 /*
  * Check if packet is TCP ACK. Here we expecting not-vlan-tagged Ethernet frames with IP
@@ -468,7 +472,7 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 	struct ether_header *eh;
 	struct ip      *ip4hdr;
 	struct ip6_hdr *ip6hdr;
-	//uint16_t src_port = 0, dst_port = 0;
+	int p2p = 0;
 	uint8_t proto;
 	int prepend = 0;
 	void *ulp = NULL;
@@ -478,9 +482,9 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 	int psize = m->m_pkthdr.len;
 
 	/* First, check if we need to do anything. */
-	if (hinfo->cfg.fifo && !hinfo->cfg.prioritize_acks)
+	if (hinfo->cfg.fifo && !hinfo->cfg.prioritize_acks && !hinfo->cfg.p2p_div)
 		goto enqueue;
-	
+
 	if (!try_pullup(&m, off+sizeof(*eh))) {
 		goto enqueue;
 	} else if (m==NULL)
@@ -500,26 +504,42 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 			{ NG_FREE_ITEM(item); return 0; };
 
 		ip4hdr = mtodo(m, off);
-		
+
 		if (hinfo->cfg.drr)
 			hash =  ( INADDR_HASHVAL(ip4hdr->ip_src.s_addr)
 				 ^INADDR_HASHVAL(ip4hdr->ip_dst.s_addr))
 				% NGPL_QUEUES;
-		
-		if (hinfo->cfg.prioritize_acks) {
-			if (ip4hdr->ip_p == IPPROTO_TCP) {
-				off += ip4hdr->ip_hl*4;
 
-				ulp = mtodo(m, off);
-				if (try_pullup(&m, off+sizeof(struct tcphdr))) {
-					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
+		/* Skip L4 processing if not needed*/
+		if (!hinfo->cfg.prioritize_acks && !hinfo->cfg.p2p_div)
+			goto enqueue;
 
-					if (	(TCP(ulp)->th_flags & TH_ACK) &&
-						(psize < 100)
-					){
-						prepend = 1;
-					}
-				}
+		off += ip4hdr->ip_hl*4;
+		ulp = mtodo(m, off);
+		if (ip4hdr->ip_p == IPPROTO_TCP) {
+
+			if (try_pullup(&m, off+sizeof(struct tcphdr))) {
+				if (m==NULL) { NG_FREE_ITEM(item); return 0; };
+				if (	hinfo->cfg.prioritize_acks &&
+					(TCP(ulp)->th_flags & TH_ACK) &&
+					(psize < 100)
+				)
+					prepend = 1;
+
+				if (	hinfo->cfg.p2p_div &&
+					is_p2p(ntohs(TCP(ulp)->th_sport),IPPROTO_TCP) &&
+					is_p2p(ntohs(TCP(ulp)->th_dport),IPPROTO_TCP)
+				) p2p = 1;
+			}
+		} else if (ip4hdr->ip_p == IPPROTO_UDP) {
+
+			if (try_pullup(&m, off+sizeof(struct udphdr))) {
+				if (m==NULL) { NG_FREE_ITEM(item); return 0; };
+
+				if (	hinfo->cfg.p2p_div &&
+					is_p2p(ntohs(UDP(ulp)->uh_sport),IPPROTO_UDP) &&
+					is_p2p(ntohs(UDP(ulp)->uh_dport),IPPROTO_UDP)
+				) p2p = 1;
 			}
 		}
 
@@ -536,7 +556,7 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 				 ^IN6ADDR_HASHVAL(&ip6hdr->ip6_dst))
 				% NGPL_QUEUES;
 
-		
+
 		off += sizeof(*ip6hdr);
 		proto = ip6hdr->ip6_nxt;
 		/*
@@ -551,7 +571,7 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 			case IPPROTO_HOPOPTS: /* just skip it */
 				if (try_pullup(&m,  off+sizeof(struct ip6_hbh))) {
 					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
-					
+
 					off += ((((struct ip6_hbh *)ulp)->ip6h_len + 1) << 3);
 					proto = ((struct ip6_hbh *)ulp)->ip6h_nxt;
 					ulp = NULL;
@@ -561,7 +581,7 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 			case IPPROTO_ROUTING: /* just skip it */
 				if (try_pullup(&m,  off+sizeof(struct ip6_rthdr))) {
 					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
-					
+
 					off += ((((struct ip6_rthdr *)ulp)->ip6r_len + 1) << 3);
 					proto = ((struct ip6_rthdr *)ulp)->ip6r_nxt;
 					ulp = NULL;
@@ -572,10 +592,26 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 				if (try_pullup(&m,  off+sizeof(struct tcphdr))) {
 					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
 
-					if (TCP(ulp)->th_flags & TH_ACK &&
+					if (hinfo->cfg.prioritize_acks &&
+						TCP(ulp)->th_flags & TH_ACK &&
 						(psize < 100)) {
 						prepend = 1;
 					}
+					if (	hinfo->cfg.p2p_div &&
+						is_p2p(ntohs(TCP(ulp)->th_sport),IPPROTO_TCP) &&
+						is_p2p(ntohs(TCP(ulp)->th_dport),IPPROTO_TCP)
+					) p2p = 1;
+				}
+			break;
+
+			case IPPROTO_UDP:
+				if (try_pullup(&m,  off+sizeof(struct udphdr))) {
+					if (m==NULL) { NG_FREE_ITEM(item); return 0; };
+
+					if (	hinfo->cfg.p2p_div &&
+						is_p2p(ntohs(UDP(ulp)->uh_sport),IPPROTO_UDP) &&
+						is_p2p(ntohs(UDP(ulp)->uh_dport),IPPROTO_UDP)
+					) p2p = 1;
 				}
 			break;
 			/* Currently ignore all other */
@@ -585,11 +621,15 @@ ngpl_enqueue(struct hookinfo * hinfo, item_p item, struct mbuf *m)
 	break;
 	}
 enqueue:
-	/* 
+	/*
 	 * Now we have selected queue and determined to append or to prepend packet
 	 * to queue. Do it.
 	 */
-	ngpl_f = hinfo->fifo_array[hash];
+	if (p2p) {
+		ngpl_f = hinfo->p2pq;
+	} else {
+		ngpl_f = hinfo->fifo_array[hash];
+	}
 
 	if (ngpl_f == NULL) {
 		ngpl_f = uma_zalloc(ngpl_zone_fifo, M_NOWAIT);
@@ -611,7 +651,6 @@ enqueue:
 			return (0);
 		}
 
-		
 		ngpl_f->packets++;
 	}
 	hinfo->run.qin_frames++;
@@ -636,7 +675,8 @@ static inline void
 hook_refill(struct hookinfo *hinfo, struct timeval *now)
 {
 	struct timeval timediff;
-        u_int32_t cbs = hinfo->cfg.bandwidth/8;
+        uint32_t cbs = hinfo->cfg.bandwidth/8;
+	uint32_t cbs_p2p = (hinfo->cfg.p2p_div)?cbs/hinfo->cfg.p2p_div:cbs;
 
 	/*
 	 * Refill token bucket. Once per tick, because I'm sure it will not refill
@@ -647,12 +687,17 @@ hook_refill(struct hookinfo *hinfo, struct timeval *now)
 	if (timevalisset(&timediff)) { /* At least one tick since last refill */
 		if (timediff.tv_sec == 0) {
 			hinfo->run.tc += (cbs*timediff.tv_usec/1000000 );
+			hinfo->run.tc_p2p +=
+					(cbs_p2p*timediff.tv_usec/(1000000));
 		/* We have hardcoded max tokens for one second on max bandwidth. */
-			if (hinfo->run.tc > cbs) {
+			if (hinfo->run.tc > cbs)
 				hinfo->run.tc = cbs;
-			}
+			if (hinfo->run.tc_p2p > cbs_p2p)
+				hinfo->run.tc_p2p = cbs_p2p;
+
 		} else {
 			hinfo->run.tc = cbs;
+			hinfo->run.tc_p2p = cbs_p2p;
 		}
 		hinfo->last_refill = *now;
 	}
@@ -688,7 +733,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	struct timeval uuptime;
 	struct timeval *now = &uuptime;
 	struct mbuf *m;
-	u_int64_t psize;
+	uint64_t psize;
 
 	getmicrouptime(now);
 
@@ -705,8 +750,13 @@ ngpl_rcvdata(hook_p hook, item_p item)
 	}
 
 	/* If queue is empty and there's enough tokens, just forward frame, don't enqueue it.
+	 * Also skip this optimization if saparate p2p shaping is enabled.
 	 */
-	if (((!hinfo->run.qin_frames) && hinfo->run.tc >= psize) || hinfo->noqueue) {
+	if ((!hinfo->cfg.p2p_div	/* p2p not shaped separately */
+	    && !hinfo->run.qin_frames	/* no packets in queue */
+	    && hinfo->run.tc >= psize) 	/* there's enough tokens */
+	    || hinfo->noqueue) 		/* OR qeueing is disabled */
+	{
 		int error = 0;
 		struct hookinfo *dest;
 
@@ -719,7 +769,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 			hinfo->stats.fwd_frames++;
 			hinfo->stats.fwd_octets += psize;
 			/* Decrement tokens */
-			hinfo->run.tc -= psize;
+			if (!hinfo->noqueue) hinfo->run.tc -= psize;
 		}
 		return(error);
 	}
@@ -733,8 +783,7 @@ ngpl_rcvdata(hook_p hook, item_p item)
 
 
 /*
- * Dequeueing sequence - we basically do the following:
- * TODO: rewrite.
+ * Dequeue packets.
  */
 void
 pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
@@ -763,6 +812,20 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 		/* Stop queue processing if there's not enougth tokens */
 		if (psize > hinfo->run.tc)
 			break;
+		/*
+		 * Additional check for p2p queue. If we're out of p2p tokens and there's
+		 * other queues, switch to next. Else just brake up.
+		 */
+		if (hinfo->p2pq == ngpl_f && psize > hinfo->run.tc) {
+			if (TAILQ_NEXT(ngpl_f, fifo_le)) {
+				TAILQ_REMOVE(&hinfo->fifo_head, ngpl_f, fifo_le);
+				TAILQ_INSERT_TAIL(&hinfo->fifo_head,
+				    ngpl_f, fifo_le);
+				continue;
+			} else {
+				break;
+			}
+		}
 
 		/* Deficit Round Robin (DRR) processing */
 		if (hinfo->cfg.drr) {
@@ -798,6 +861,8 @@ pipe_dequeue(struct hookinfo *hinfo, struct timeval *now) {
 			hinfo->stats.fwd_octets += psize;
 			/* Decrement tokens */
 			hinfo->run.tc -= psize;
+			if (hinfo->p2pq == ngpl_f)
+				hinfo->run.tc_p2p -= psize;
 		}
 	}
 
